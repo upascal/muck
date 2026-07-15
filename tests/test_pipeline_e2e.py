@@ -1146,6 +1146,81 @@ def test_array_path_entity_fields_resolve():
     assert "Sen. Angus King" in text and "Rep. Jane Public" in text
 
 
+def test_parse_relation_spec():
+    from muck.extract.entities import _parse_relation
+
+    r = _parse_relation("registrant.name:org -> honoree:person : donated_to")
+    assert r == {"predicate": "donated_to", "src_field": "registrant.name", "src_type": "org",
+                 "dst_field": "honoree", "dst_type": "person"}
+    assert _parse_relation("a:org -> b:org : x")["dst_type"] == "org"
+    assert _parse_relation("no arrow here") is None      # malformed -> skipped, not fatal
+    assert _parse_relation("a -> b") is None              # missing predicate
+
+
+def test_typed_relations_directed_and_cited(tmp_path):
+    """donated_to / lobbied_for become directed, cited edges over resolved entities."""
+    import muck.extract.entities as ent
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "filings_2024.json").write_text(json.dumps([
+        {"filing_uuid": "F1", "registrant": {"name": "Acme Strategies LLC"},
+         "client": {"name": "Globex Corp"}},
+    ]))
+    (corpus / "contributions_2024.json").write_text(json.dumps([
+        {"filing_uuid": "C1", "registrant": {"name": "Acme Strategies LLC"},
+         "contribution_items": [{"honoree_name": "The Honorable Jane Public"}]},
+    ]))
+    (corpus / "press.jsonl").write_text(
+        json.dumps({"url": "u1", "title": "t", "text": "Senator Jane Public spoke on reform.",
+                    "member": {"name": "Jane Public"}}) + "\n")
+
+    muck_dir = corpus / cfg.MUCK_DIRNAME
+    (muck_dir / "cache").mkdir(parents=True)
+    cfg.write_default_config(muck_dir)
+    settings = cfg.load_settings(muck_dir)
+    settings.embedder.enabled = False
+    settings.mapper.sources = [
+        cfg.SourceMap(match="*press*", text_fields=["title", "text"],
+                      entity_fields=["member.name:person"]),
+        cfg.SourceMap(match="*filings*", structured_fields=["registrant.name", "client.name"],
+                      entity_fields=["registrant.name:org", "client.name:org"],
+                      relations=["registrant.name:org -> client.name:org : lobbied_for"]),
+        cfg.SourceMap(match="*contributions*",
+                      structured_fields=["registrant.name", "contribution_items[].honoree_name as honoree"],
+                      entity_fields=["registrant.name:org", "contribution_items[].honoree_name:person"],
+                      relations=["registrant.name:org -> honoree:person : donated_to"]),
+    ]
+    conn = connect(muck_dir / DB_FILENAME)
+    init_schema(conn)
+    files = [str(corpus / f) for f in ("filings_2024.json", "contributions_2024.json", "press.jsonl")]
+    pipeline.ingest(conn, files)
+    pipeline.extract(conn, settings, pipeline.MAPPER_TYPES)
+    pipeline.extract(conn, settings, pipeline.PARSER_TYPES)
+    res = pipeline.run_index(conn, settings)
+
+    assert res["relations"]["by_predicate"].get("lobbied_for") == 1
+    assert res["relations"]["by_predicate"].get("donated_to") == 1
+
+    # outgoing from the registrant: both predicates
+    acme = ent.list_entities(conn, etype="org", name="Acme")[0]
+    out = ent.entity_detail(conn, acme["entity_id"])["relations"]["outgoing"]
+    assert "lobbied_for" in out and "donated_to" in out
+
+    # the titled honoree folded to the press person, and the money edge points INTO her, cited
+    jane = ent.list_entities(conn, etype="person", name="Jane Public")[0]
+    inc = ent.entity_detail(conn, jane["entity_id"])["relations"]["incoming"]
+    assert "donated_to" in inc
+    donor = inc["donated_to"][0]
+    assert donor["canonical_name"].startswith("Acme")
+    assert donor["token"] and "@" in donor["token"]  # each typed edge is verifiable
+    assert citelib.resolve(conn, settings, donor["token"])["valid"]
+
+    # global graph view
+    top = ent.list_relations(conn, predicate="donated_to")
+    assert top and top[0]["src"].startswith("Acme") and "Jane" in top[0]["dst"]
+
+
 def test_xml_record_path_multi(tmp_path):
     """Bulk-export XML: record_path splits one file into many docs, each independently citable."""
     corpus = tmp_path / "corpus"

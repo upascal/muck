@@ -14,6 +14,7 @@ import json
 import re
 import sqlite3
 from collections import Counter, defaultdict
+from fnmatch import fnmatch
 from itertools import combinations
 
 from ..cite import make_token
@@ -59,6 +60,43 @@ def normalize_key(name: str, etype: str, extra_suffixes: tuple[str, ...] = ()) -
 
 def _entity_id(etype: str, key: str) -> str:
     return "e_" + hashlib.sha1(f"{etype}|{key}".encode()).hexdigest()[:12]
+
+
+# --- typed relations (Tier 2) ------------------------------------------------
+
+_REL_SKIP = {"", "n/a", "none", "null", "-", "various"}
+
+
+def _parse_relation(spec: str) -> dict | None:
+    """Parse ``"src_field:src_type -> dst_field:dst_type : predicate"`` into its parts.
+
+    ``src_field``/``dst_field`` name structured_json keys (aliases); types default to ``org``.
+    Returns None for a malformed spec (so a bad line is skipped, not fatal).
+    """
+    lhs, arrow, rhs = spec.partition(" -> ")
+    if not arrow:
+        return None
+    dst_part, sep, predicate = rhs.rpartition(" : ")
+    if not sep:
+        return None
+    sf, _, st = lhs.strip().partition(":")
+    df, _, dt = dst_part.strip().partition(":")
+    if not (sf.strip() and df.strip() and predicate.strip()):
+        return None
+    return {
+        "predicate": predicate.strip(),
+        "src_field": sf.strip(), "src_type": st.strip() or "org",
+        "dst_field": df.strip(), "dst_type": dt.strip() or "org",
+    }
+
+
+def _as_list(v) -> list:
+    """Scalar leaves of a structured_json value, dropping placeholder non-entities (N/A, None)."""
+    if v is None:
+        return []
+    items = v if isinstance(v, list) else [v]
+    return [x for x in items
+            if isinstance(x, (str, int, float)) and str(x).strip().lower() not in _REL_SKIP]
 
 
 _TOKEN_RE = re.compile(r"\w+")
@@ -222,6 +260,89 @@ def build_entities(conn: sqlite3.Connection, settings) -> dict:
     return {"entities": len(groups), "mentions": n_mentions, "edges": len(edge_w)}
 
 
+_RELATIONS_DDL = (
+    "CREATE TABLE IF NOT EXISTS entity_relations ("
+    " src_entity_id TEXT NOT NULL, dst_entity_id TEXT NOT NULL, predicate TEXT NOT NULL,"
+    " weight INTEGER NOT NULL DEFAULT 0, doc_id TEXT,"
+    " PRIMARY KEY (src_entity_id, dst_entity_id, predicate));"
+    "CREATE INDEX IF NOT EXISTS ix_entity_relations_src ON entity_relations(src_entity_id);"
+    "CREATE INDEX IF NOT EXISTS ix_entity_relations_dst ON entity_relations(dst_entity_id);"
+)
+
+
+def build_relations(conn: sqlite3.Connection, settings) -> dict:
+    """Typed relations from structured fields → directed, citable ``entity_relations`` rows.
+
+    For each source that declares ``relations`` (``"src_field:type -> dst_field:type : predicate"``),
+    read each document's stored ``structured_json`` (no re-parse), resolve both field values to
+    entity_ids exactly as the resolver does (``normalize_key`` → ``_entity_id``), and record one
+    directed edge per ``(predicate, src, dst)`` with a count and a representative doc. Idempotent;
+    runs standalone on a built index and is also called at the end of ``run_index``.
+    """
+    conn.executescript(_RELATIONS_DDL)  # tolerate an index built before this table existed
+    conn.execute("DELETE FROM entity_relations")
+
+    ecfg = getattr(settings, "entities", None)
+    extra = tuple(getattr(ecfg, "extra_org_suffixes", ()) or ())
+
+    def _parsed(fm):
+        return [r for r in (_parse_relation(s) for s in (getattr(fm, "relations", []) or [])) if r]
+
+    specs: list[tuple[str, list[dict]]] = []
+    for sm in getattr(settings.mapper, "sources", []) or []:
+        parsed = _parsed(sm)
+        if parsed:
+            pat = sm.match if sm.match.startswith(("/", "*")) else "*/" + sm.match
+            specs.append((pat, parsed))
+    gparsed = _parsed(getattr(settings.mapper, "fields", None))
+    if not specs and not gparsed:
+        return {"predicates": 0, "relations": 0}
+
+    known = {r[0] for r in conn.execute("SELECT entity_id FROM entities")}
+    acc: dict[tuple[str, str, str], list] = defaultdict(lambda: [0, None])
+    for doc in conn.execute(
+        "SELECT doc_id, source_path, structured_json FROM documents "
+        "WHERE structured_json IS NOT NULL AND structured_json != ''"
+    ):
+        rels = gparsed
+        for pat, parsed in specs:
+            if fnmatch(doc["source_path"], pat):
+                rels = parsed
+                break
+        if not rels:
+            continue
+        try:
+            sj = json.loads(doc["structured_json"])
+        except (ValueError, TypeError):
+            continue
+        for rel in rels:
+            svals = _as_list(sj.get(rel["src_field"]))
+            dvals = _as_list(sj.get(rel["dst_field"]))
+            if not svals or not dvals:
+                continue
+            src_eids = {_entity_id(rel["src_type"], k)
+                        for k in (normalize_key(str(v), rel["src_type"], extra) for v in svals) if k}
+            dst_eids = {_entity_id(rel["dst_type"], k)
+                        for k in (normalize_key(str(v), rel["dst_type"], extra) for v in dvals) if k}
+            for se in src_eids & known:
+                for de in dst_eids & known:
+                    if de == se:
+                        continue
+                    slot = acc[(rel["predicate"], se, de)]
+                    slot[0] += 1
+                    if slot[1] is None:
+                        slot[1] = doc["doc_id"]
+
+    conn.executemany(
+        "INSERT INTO entity_relations(predicate, src_entity_id, dst_entity_id, weight, doc_id) "
+        "VALUES(?,?,?,?,?)",
+        [(p, s, d, w, doc) for (p, s, d), (w, doc) in acc.items()],
+    )
+    conn.commit()
+    by_pred: Counter = Counter(p for (p, s, d) in acc)
+    return {"predicates": len(by_pred), "relations": len(acc), "by_predicate": dict(by_pred)}
+
+
 # --- query -------------------------------------------------------------------
 
 def list_entities(conn, etype=None, name=None, min_count=1, limit=50) -> list[dict]:
@@ -246,6 +367,32 @@ def list_entities(conn, etype=None, name=None, min_count=1, limit=50) -> list[di
         d["n_aliases"] = n_aliases
         out.append(d)
     return out
+
+
+def list_relations(conn, predicate=None, name=None, limit=25) -> list[dict]:
+    """Strongest typed relations by weight (the directed graph view), optionally filtered."""
+    where, params = [], []
+    if predicate:
+        where.append("r.predicate = ?")
+        params.append(predicate)
+    if name:
+        where.append("(se.canonical_name LIKE ? OR de.canonical_name LIKE ?)")
+        params += [f"%{name}%", f"%{name}%"]
+    sql = (
+        "SELECT r.predicate, r.weight, r.doc_id, "
+        "se.canonical_name AS src, se.entity_type AS src_type, "
+        "de.canonical_name AS dst, de.entity_type AS dst_type "
+        "FROM entity_relations r "
+        "JOIN entities se ON se.entity_id=r.src_entity_id "
+        "JOIN entities de ON de.entity_id=r.dst_entity_id "
+    )
+    if where:
+        sql += "WHERE " + " AND ".join(where) + " "
+    sql += "ORDER BY r.weight DESC LIMIT ?"
+    try:
+        return [dict(r) for r in conn.execute(sql, [*params, limit])]
+    except sqlite3.OperationalError:
+        return []  # entity_relations absent — run `muck relations --rebuild` or rebuild the index
 
 
 def entity_detail(conn, entity_id, max_mentions=10) -> dict:
@@ -282,6 +429,40 @@ def entity_detail(conn, entity_id, max_mentions=10) -> dict:
                 "entity_id": nb["nb"], "canonical_name": ne["canonical_name"],
                 "entity_type": ne["entity_type"], "co_documents": nb["weight"],
             })
+    # typed relations (directed, citable) — grouped by predicate, in both directions
+    relations: dict[str, dict] = {"outgoing": {}, "incoming": {}}
+
+    def _rel_row(counter_eid, pred, weight, doc_id, direction):
+        ne = conn.execute(
+            "SELECT canonical_name, entity_type FROM entities WHERE entity_id=?", (counter_eid,)
+        ).fetchone()
+        if not ne:
+            return
+        token = None
+        if doc_id:
+            m = conn.execute(
+                "SELECT char_start, char_end, raw_text FROM mentions WHERE entity_id=? AND doc_id=? LIMIT 1",
+                (counter_eid, doc_id),
+            ).fetchone()
+            if m:
+                token = make_token(doc_id, m["char_start"], m["char_end"], m["raw_text"])
+        relations[direction].setdefault(pred, []).append({
+            "entity_id": counter_eid, "canonical_name": ne["canonical_name"],
+            "entity_type": ne["entity_type"], "weight": weight, "doc_id": doc_id, "token": token,
+        })
+
+    try:
+        for r in conn.execute(
+            "SELECT predicate, dst_entity_id, weight, doc_id FROM entity_relations "
+            "WHERE src_entity_id=? ORDER BY weight DESC LIMIT 40", (entity_id,)):
+            _rel_row(r["dst_entity_id"], r["predicate"], r["weight"], r["doc_id"], "outgoing")
+        for r in conn.execute(
+            "SELECT predicate, src_entity_id, weight, doc_id FROM entity_relations "
+            "WHERE dst_entity_id=? ORDER BY weight DESC LIMIT 40", (entity_id,)):
+            _rel_row(r["src_entity_id"], r["predicate"], r["weight"], r["doc_id"], "incoming")
+    except sqlite3.OperationalError:
+        pass  # index predates entity_relations; run `muck relations` (or rebuild) to populate
+
     return {
         "entity_id": entity_id,
         "canonical_name": e["canonical_name"],
@@ -291,6 +472,7 @@ def entity_detail(conn, entity_id, max_mentions=10) -> dict:
         "aliases": aliases,
         "mentions": mentions,
         "co_occurring": neighbors,
+        "relations": relations,
     }
 
 
@@ -321,6 +503,7 @@ def dossier(conn, settings, name: str, examples: int = 4) -> dict:
                 "type": etype, "aliases": det["aliases"],
                 "mention_count": e["mention_count"], "doc_count": e["doc_count"],
                 "co_occurring": det["co_occurring"],
+                "relations": det.get("relations", {}),
             })
 
     # 2. cross-source appearances — FTS phrase over the (flattened) document text, grouped by source
@@ -355,7 +538,9 @@ def dossier(conn, settings, name: str, examples: int = 4) -> dict:
         "note": (
             "Drill-down dossier. `appearances_by_source` shows WHERE this entity is named — a name "
             "present in both a press source and a contributions/filings source is a say-vs-pay / "
-            "follow-the-money juxtaposition to chase. `resolved.co_occurring` is its network. Read a "
-            "source in full with `muck read <doc_id>` and confirm any quote with `muck verify`."
+            "follow-the-money juxtaposition to chase. `resolved.co_occurring` is its co-occurrence "
+            "network; `resolved.relations` are TYPED, directed, cited edges (outgoing/incoming by "
+            "predicate, e.g. donated_to / lobbied_for) — each carries a doc_id + token to verify. "
+            "Read a source in full with `muck read <doc_id>` and confirm any quote with `muck verify`."
         ),
     }

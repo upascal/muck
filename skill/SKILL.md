@@ -120,11 +120,16 @@ do not treat empty search results as evidence of absence** — the corpus hasn't
   entities it co-occurs with — your cross-reference / network view.
 - **Drill down on ONE entity (context assembly):** `muck entity "<name>"` assembles a cross-source
   dossier in one shot — where the name appears **grouped by source** (so press vs filings vs
-  contributions separate out), its resolved identity + co-occurrence network, and example citations.
-  A name present in **both** a press source **and** a contributions/filings source is a say-vs-pay /
-  follow-the-money juxtaposition to chase. Runs at query time and catches messy/unresolved variants
-  (e.g. an LD-203 honoree "Sen. Dan Sullivan"), so use it to *hone in* on a person/org across the
-  whole corpus without hand-joining.
+  contributions separate out), its resolved identity + co-occurrence network, **typed relations**
+  (`relations.outgoing`/`incoming` by predicate, e.g. `donated_to`/`lobbied_for` — each cited), and
+  example citations. A name present in **both** a press source **and** a contributions/filings source
+  is a say-vs-pay / follow-the-money juxtaposition to chase. Runs at query time and catches
+  messy/unresolved variants (e.g. an LD-203 honoree "Sen. Dan Sullivan"), so use it to *hone in* on a
+  person/org across the whole corpus without hand-joining.
+- **Typed relations (directed graph):** `muck relations --predicate donated_to` (or `lobbied_for`)
+  lists the strongest directed edges between resolved entities — who gave to whom, who lobbies for
+  whom. Each edge cites a representative record: a lead you confirm with `muck verify` and log with
+  `muck finding add`. This is the ground-truth relationship layer, distinct from fuzzy co-occurrence.
 - **Entity + similarity:** `muck search "<query>" --person "X"` (or `--org`, `--entity <id>`)
   restricts to chunks mentioning that resolved entity and ranks them by cosine to the query;
   add `--min-score` to threshold. This is the "person = X AND semantically about Y" query.

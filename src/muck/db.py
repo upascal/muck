@@ -115,6 +115,20 @@ CREATE TABLE IF NOT EXISTS entity_edges (
     PRIMARY KEY (src_entity_id, dst_entity_id, edge_type)
 );
 
+-- Typed relations (directed, ground-truth from structured fields — distinct from the symmetric
+-- co_doc co-occurrence hints above). Each row derives from a specific record, so it carries a
+-- representative doc_id the agent can cite: a lead that feeds the findings/audit assert layer.
+CREATE TABLE IF NOT EXISTS entity_relations (
+    src_entity_id TEXT NOT NULL,
+    dst_entity_id TEXT NOT NULL,
+    predicate     TEXT NOT NULL,          -- e.g. lobbied_for, donated_to
+    weight        INTEGER NOT NULL DEFAULT 0,   -- # of records establishing this relation
+    doc_id        TEXT,                    -- a representative source document (for citation)
+    PRIMARY KEY (src_entity_id, dst_entity_id, predicate)
+);
+CREATE INDEX IF NOT EXISTS ix_entity_relations_src ON entity_relations(src_entity_id);
+CREATE INDEX IF NOT EXISTS ix_entity_relations_dst ON entity_relations(dst_entity_id);
+
 -- Topical clustering (Phase 2): KMeans over embeddings + c-tf-idf labels.
 CREATE TABLE IF NOT EXISTS clusters (
     cluster_id INTEGER PRIMARY KEY,

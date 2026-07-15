@@ -563,6 +563,31 @@ def entity(
     _emit(out)
 
 
+@app.command()
+def relations(
+    rebuild: bool = typer.Option(False, "--rebuild", help="(Re)build the typed-relation table on the existing index (no re-embed)"),
+    predicate: str = typer.Option(None, "--predicate", help="Filter by relation type, e.g. donated_to / lobbied_for"),
+    name: str = typer.Option(None, "--name", help="Substring filter on either endpoint's name"),
+    k: int = typer.Option(25, "-k", "--k"),
+):
+    """Typed, directed relations between resolved entities (e.g. donated_to, lobbied_for).
+
+    Derived from structured fields during `muck build`; each edge cites a representative record.
+    `--rebuild` re-derives them on an existing index without re-embedding. Without it, lists the
+    strongest relations — the graph view (pair with `muck entity` to walk one entity's edges).
+    """
+    muck_dir, settings, conn = _resolve()
+    if rebuild:
+        out = entitieslib.build_relations(conn, settings)
+        n = out.get("relations", 0)
+    else:
+        out = entitieslib.list_relations(conn, predicate=predicate, name=name, limit=k)
+        n = len(out)
+    tracelog.log(conn, muck_dir, "relations",
+                 {"rebuild": rebuild, "predicate": predicate, "name": name}, n_results=n)
+    _emit(out)
+
+
 finding_app = typer.Typer(no_args_is_help=True, help="Manage the findings ledger.")
 app.add_typer(finding_app, name="finding")
 

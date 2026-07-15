@@ -422,9 +422,10 @@ def run_index(conn, settings: Settings, only_new: bool = True, batch: int = EMBE
         "embeddings": "on" if embeddings_active else "off (keyword-only)",
     }
     if settings.entities.resolve:
-        from .extract.entities import build_entities
+        from .extract.entities import build_entities, build_relations
 
         result["entity_index"] = build_entities(conn, settings)
+        result["relations"] = build_relations(conn, settings)  # typed edges over resolved entities
         notice = _entity_inertia_notice(conn)
         if notice:
             result["notice"] = notice

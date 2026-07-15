@@ -91,6 +91,28 @@ money, and lobbying together. Person names are normalized to merge titled/formal
 Honorable U.S. Senator Angus S. King, Jr.` → `angus king`), so cross-source linking survives the
 honorifics and middle initials that filings add.
 
+### Typed relations (the directed graph — who → who)
+
+Beyond co-occurrence, declare **directed relations between two resolved entities** with
+`relations`, read from structured fields: `"src_field:type -> dst_field:type : predicate"`. Both
+endpoints must also be `entity_fields` (so they resolve); `src_field`/`dst_field` name the
+`structured_json` keys (aliases).
+
+```toml
+# filings: the registrant (firm) lobbies for the client
+relations = ["registrant.name:org -> client.name:org : lobbied_for"]
+# contributions: the registrant's PAC donated to the honoree (member) — the say-vs-pay edge
+relations = ["registrant.name:org -> honoree:person : donated_to"]
+```
+
+`muck build` turns these into a directed, **cited** `entity_relations` table (each edge derives from
+a specific record, so it carries a representative `doc_id` + citation token). Then `muck relations`
+lists the strongest edges (`--predicate donated_to`), and `muck entity "<name>"` shows one entity's
+`relations.outgoing` / `relations.incoming` grouped by predicate — each a lead you *verify* by
+citing its record (the token feeds straight into the findings/`audit` layer). Unlike the symmetric
+`co_doc` co-occurrence hints, these are ground truth from the data, not inference. `muck relations
+--rebuild` re-derives them on an existing index without re-embedding.
+
 ### Citable vs aggregatable — and how to get both (no pre-flattening)
 
 A field in `text_fields` is rendered into the document's searchable text, so it is **citable**

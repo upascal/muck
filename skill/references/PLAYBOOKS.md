@@ -97,13 +97,15 @@ their chamber/committee and the money they received, around the same period. Fla
 ```
 muck entity "<member>"                                         # START HERE: cross-source dossier —
                                                                # do they appear in BOTH press and
-                                                               # contributions? that's the juxtaposition
+                                                               # contributions? see relations.incoming
+                                                               # donated_to = who paid them
+muck relations --predicate donated_to --name "<member>"        # the directed money edges INTO them
 muck search "<member> <issue>" --person "<member>"             # what they SAY (press releases)
-muck grep "<member>" --all                                     # LD-203 filings where they're the honoree
 muck aggregate --by government_entity --agg count               # what's lobbied at their body
 ```
-Start with `muck entity` — if a member shows up in both a press source and a contributions source,
-that's the lead; then read both sides and line them up by quarter. A mismatch is the story.
+Start with `muck entity` — its `relations.incoming.donated_to` names who gave to the member (each
+edge cited); line that against what they SAY on the same issue. A mismatch is the story. Confirm
+each side with `muck verify` before asserting it as a `muck finding`.
 **Verify:** cite the public statement AND the contradicting record; both tokens must verify.
 **Generalizes to:** any corpus pairing public statements with financial disclosures.
 

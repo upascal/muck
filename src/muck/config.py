@@ -26,6 +26,11 @@ class FieldMap(BaseModel):
     text_fields: list[str] = Field(default_factory=list)  # [] = flatten all string fields
     structured_fields: list[str] = Field(default_factory=list)  # promoted for SQL/aggregation
     entity_fields: list[str] = Field(default_factory=list)  # names fed to the resolver
+    # Typed relations between two resolved entities, read from structured fields:
+    #   "src_field:src_type -> dst_field:dst_type : predicate"
+    # e.g. "registrant.name:org -> client.name:org : lobbied_for". src_field/dst_field name the
+    # structured_json keys (aliases); both must also be entity_fields so they resolve to entities.
+    relations: list[str] = Field(default_factory=list)
 
 
 class SourceMap(FieldMap):

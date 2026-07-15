@@ -27,6 +27,8 @@ structured_fields = [
     "lobbying_activities[].description as activity_desc",
 ]
 entity_fields = ["registrant.name:org", "client.name:org"]
+# typed relation: the registrant (lobbying firm) lobbies for the client
+relations = ["registrant.name:org -> client.name:org : lobbied_for"]
 
 [[mapper.sources]]
 match = "*/senate/*/contributions*"
@@ -40,6 +42,8 @@ structured_fields = [
 # honoree resolves as a person so an LD-203 honoree links to the same entity as the press
 # member (cross-source say-vs-pay graph); kept as a structured field above for aggregation.
 entity_fields = ["registrant.name:org", "contribution_items[].honoree_name:person"]
+# typed relation: the registrant's PAC/lobbyists donated to the honoree (member) — say-vs-pay
+relations = ["registrant.name:org -> honoree:person : donated_to"]
 
 [embedder]
 enabled = true
