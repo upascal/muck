@@ -1105,6 +1105,47 @@ def test_entity_matching_knobs(tmp_path):
     assert normalize_key("Acme GmbH", "org", ("gmbh",)) == normalize_key("Acme", "org", ("gmbh",))
 
 
+def test_person_name_folds_titles_suffixes_initials():
+    """A titled/formal person variant folds to the same key as a bare name (cross-source link)."""
+    from muck.extract.entities import normalize_key
+
+    bare = normalize_key("Angus King", "person")
+    assert bare == "angus king"
+    # honorific + U.S. Senator + middle initial + generational suffix all strip away
+    assert normalize_key("The Honorable U.S. Senator Angus S. King, Jr.", "person") == bare
+    assert normalize_key("Sen. Angus King", "person") == bare
+    # distinct people must NOT merge
+    assert normalize_key("Angus King", "person") != normalize_key("Amy King", "person")
+    # a name that is ALL titles doesn't normalize away to empty
+    assert normalize_key("Senator", "person") != ""
+
+
+def test_array_path_entity_fields_resolve():
+    """`field[].sub:type` declarations resolve nested actors as entities (not just flat fields)."""
+    from muck.mappers.json_mapper import _extract_entity_values, render_text
+
+    rec = {
+        "registrant": {"name": "PAC Co"},
+        "contribution_items": [
+            {"honoree_name": "Sen. Angus King", "amount": 5000},
+            {"honoree_name": "Rep. Jane Public", "amount": 2500},
+        ],
+    }
+    ents = _extract_entity_values(rec, ["contribution_items[].honoree_name:person"])
+    names = {e["name"] for e in ents}
+    assert names == {"Sen. Angus King", "Rep. Jane Public"}
+    assert all(e["type"] == "person" for e in ents)
+    # and the array-path entity field renders into searchable text even when text_fields is set
+    # (exercises _render_field's `[]` branch, not the whole-record flatten fallback), so those
+    # honoree mentions are findable by the resolver
+    fields = cfg.FieldMap(
+        text_fields=["registrant.name"],
+        entity_fields=["contribution_items[].honoree_name:person"],
+    )
+    text = render_text(rec, fields)
+    assert "Sen. Angus King" in text and "Rep. Jane Public" in text
+
+
 def test_xml_record_path_multi(tmp_path):
     """Bulk-export XML: record_path splits one file into many docs, each independently citable."""
     corpus = tmp_path / "corpus"

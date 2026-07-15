@@ -4,4 +4,4 @@ Deterministic tools (map → chunk → embed → index → cluster → search �
 do the heavy lifting so an agent reads only retrieved, citation-verified snippets.
 """
 
-__version__ = "1.0.3"
+__version__ = "1.0.4"

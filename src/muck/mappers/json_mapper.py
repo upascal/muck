@@ -155,6 +155,10 @@ def _flatten(obj: Any, prefix: str, out: list[str]) -> None:
 
 
 def _render_field(record: Any, name: str, lines: list[str]) -> None:
+    if "[]" in name:  # array-path: render each scalar leaf so it's searchable + citable
+        for v in _get_multi(record, name):
+            lines.append(f"{name}: {_scalar(v)}")
+        return
     val = _get(record, name)
     if val is None:
         return
@@ -190,15 +194,22 @@ def render_text(record: Any, fields: FieldMap) -> str:
 
 
 def _extract_entity_values(record: dict, entity_fields: list[str]) -> list[dict]:
-    """Parse 'field:type' declarations into typed entity mentions (type defaults to org)."""
+    """Parse 'field:type' declarations into typed entity mentions (type defaults to org).
+
+    A field name may carry the ``[]`` array-path syntax (e.g.
+    ``contribution_items[].honoree_name:person``) — every scalar leaf across the arrays
+    becomes one mention, so nested actors resolve as entities just like flat fields.
+    """
     out: list[dict] = []
     for spec in entity_fields:
         field_name, _, etype = spec.partition(":")
         etype = etype or "org"
-        val = _get(record, field_name.strip())
-        if val is None:
-            continue
-        values = val if isinstance(val, list) else [val]
+        name = field_name.strip()
+        if "[]" in name:
+            values = _get_multi(record, name)
+        else:
+            val = _get(record, name)
+            values = val if isinstance(val, list) else ([] if val is None else [val])
         for v in values:
             if isinstance(v, (str, int, float)) and str(v).strip():
                 out.append({"type": etype, "name": str(v).strip()})

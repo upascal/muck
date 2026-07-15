@@ -37,7 +37,9 @@ structured_fields = [
     "contribution_items[].honoree_name as honoree",
     "contribution_items[].payee_name as payee",
 ]
-entity_fields = ["registrant.name:org"]
+# honoree resolves as a person so an LD-203 honoree links to the same entity as the press
+# member (cross-source say-vs-pay graph); kept as a structured field above for aggregation.
+entity_fields = ["registrant.name:org", "contribution_items[].honoree_name:person"]
 
 [embedder]
 enabled = true

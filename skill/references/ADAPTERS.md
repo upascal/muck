@@ -78,6 +78,19 @@ per record (a filing listing the same agency three times counts once), so use ar
 scalar or drop to `--sql`. **The `PLAYBOOKS.md` archetypes assume these fields are mapped** — without
 them, the who's-lobbied / boilerplate / revolving-door playbooks have nothing to query.
 
+**Array-paths also work in `entity_fields`** — declare a nested actor and it resolves as an entity
+(and renders into the searchable text) just like a flat field:
+
+```toml
+entity_fields = ["contribution_items[].honoree_name:person"]   # each honoree -> a person entity
+```
+
+This is what makes an actor resolvable *across sources*: an LD-203 honoree and a press member fold
+to one entity, so `muck entity "<name>"` / `muck entities --entity <id>` show that person's words,
+money, and lobbying together. Person names are normalized to merge titled/formal variants (`The
+Honorable U.S. Senator Angus S. King, Jr.` → `angus king`), so cross-source linking survives the
+honorifics and middle initials that filings add.
+
 ### Citable vs aggregatable — and how to get both (no pre-flattening)
 
 A field in `text_fields` is rendered into the document's searchable text, so it is **citable**

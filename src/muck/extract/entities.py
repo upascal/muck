@@ -25,6 +25,14 @@ ORG_SUFFIXES = {
     "lp", "llp", "pllc", "pc", "ltd", "limited", "plc", "the",
 }
 
+# Honorifics/titles and generational suffixes to strip from person names so the same
+# individual folds to one key across sources — e.g. an LD-203 honoree "The Honorable
+# U.S. Senator Angus S. King, Jr." and a press "Angus King" both normalize to "angus king".
+PERSON_DROP = {
+    "the", "hon", "honorable", "sen", "senator", "rep", "representative", "congressman",
+    "congresswoman", "us", "dr", "mr", "mrs", "ms", "jr", "sr", "ii", "iii", "iv",
+}
+
 BILL_RE = re.compile(
     r"\b(?:H\.?\s?R\.?|S\.?J\.?\s?Res\.?|H\.?J\.?\s?Res\.?|S\.?)\s?\d{1,6}\b",
     re.IGNORECASE,
@@ -41,6 +49,11 @@ def normalize_key(name: str, etype: str, extra_suffixes: tuple[str, ...] = ()) -
         suffixes = ORG_SUFFIXES.union(extra_suffixes) if extra_suffixes else ORG_SUFFIXES
         kept = [t for t in toks if t not in suffixes]
         toks = kept or toks  # don't normalize a name entirely away
+    elif etype == "person":
+        # drop titles/suffixes and lone middle initials so titled/formal variants of the
+        # same person merge across sources (press member <-> LD-203 honoree)
+        kept = [t for t in toks if t not in PERSON_DROP and len(t) > 1]
+        toks = kept or toks
     return " ".join(toks)
 
 
