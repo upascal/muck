@@ -64,7 +64,18 @@ def _root(version: bool = typer.Option(
 def _resolve():
     muck_dir = cfg.find_muck_dir()
     if muck_dir is None:
-        typer.echo("No .muck index found here. Run `muck init` first.", err=True)
+        msg = "No .muck index found here. Run `muck init` first."
+        # Common slip: run one directory too high. If an immediate child holds the index,
+        # point at it instead of a bare "not found" (find_muck_dir only walks *up*).
+        try:
+            kids = [p.name for p in Path.cwd().iterdir()
+                    if p.is_dir() and (p / cfg.MUCK_DIRNAME).is_dir()]
+        except OSError:
+            kids = []
+        if kids:
+            msg = ("No .muck index in this directory — found one in a subdirectory. "
+                   f"Run muck from there: {' or '.join('cd ' + k for k in kids[:3])}")
+        typer.echo(msg, err=True)
         raise typer.Exit(1)
     settings = cfg.load_settings(muck_dir)
     conn = connect(muck_dir / DB_FILENAME)

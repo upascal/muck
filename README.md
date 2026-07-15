@@ -29,7 +29,7 @@ uv tool install .                                         # installs from these 
 cp -R skill ~/.claude/skills/muck
 ```
 
-> If the repo is public, `uv tool install git+https://github.com/upascal/muck@v1.0.0` also works.
+> If the repo is public, `uv tool install git+https://github.com/upascal/muck@v1.0.1` also works.
 
 Verify: `muck --version` (→ `1.0.0`) and `python skill/scripts/install_check.py`.
 
