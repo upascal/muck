@@ -195,6 +195,18 @@ def status():
 
 
 @app.command()
+def fields():
+    """What's queryable in this index — aggregatable fields AND searchable record fields.
+
+    Run this before investigating: it reports ground truth from the built index so you never
+    guess whether a field is present. A field can be *searchable* (grep/verify) without being
+    *aggregatable* — the whole record is flattened into the document text.
+    """
+    muck_dir, settings, conn = _resolve()
+    _emit(pipeline.describe_fields(conn, settings))
+
+
+@app.command()
 def coverage():
     """Per-file text-coverage report + OCR/vision routing verdict (the extraction worklist).
 

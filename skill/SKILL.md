@@ -78,6 +78,14 @@ do not treat empty search results as evidence of absence** — the corpus hasn't
    exactly like any structured corpus — don't hand-roll a parallel path.
 
 ## Investigation loop
+- **Know the index — do this FIRST:** run `muck fields`. It reports, from the built index, what's
+  **aggregatable** (`muck aggregate --by <name>`) and what's **searchable** — every field flattened
+  into the document text, findable with `muck grep`/`muck search` and citable with `muck verify`.
+  **A field can be searchable without being aggregatable:** the *whole record* is indexed as text
+  unless `text_fields` narrows it, so fields that aren't structured columns (e.g. `foreign_entities`,
+  `conviction_disclosures`, nested `lobbying_activities`) are still fully findable and citable —
+  **grep the field name or a value.** NEVER conclude a field is absent by reasoning about the config
+  or from a noisy keyword grep; confirm with `muck fields` or by grepping the exact field name.
 - **Resume / orient:** `muck status` shows what's indexed *and your open threads* (open
   leads/hypotheses/questions). On a new session, start here, then `muck recall "<topic>"` or
   `muck note list --status open` to pick up where you left off — don't re-derive state.

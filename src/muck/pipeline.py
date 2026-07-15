@@ -475,6 +475,86 @@ def coverage(conn, settings: Settings) -> dict:
     return {"corpus": tally, "files": files}
 
 
+def describe_fields(conn, settings, sample: int = 300) -> dict:
+    """Ground truth for 'what can I query, and how' — so an agent checks the index instead of
+    inferring from the config. Reports **aggregatable** fields (structured_json keys, for
+    ``muck aggregate --by``) AND every top-level **record field**, flagged by whether it is
+    searchable (rendered into the document text → findable by ``muck grep``/``search`` and
+    citable) and whether it is aggregatable. A field can be searchable without being a structured
+    field — the whole record is flattened into text unless ``text_fields`` narrows it.
+
+    Samples ``sample`` documents spread evenly across the corpus (fast indexed point-lookups, so
+    all source types are represented even in a huge index).
+    """
+    from .config import fields_for
+
+    total = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+    if total == 0:
+        return {"documents": 0, "note": "empty index — run `muck build`/`muck index` first."}
+
+    def _example(v):
+        if isinstance(v, list):
+            return [(_example(x)) for x in v[:2]]
+        s = str(v)
+        return s if len(s) <= 60 else s[:60] + "…"
+
+    def _top(name: str) -> str:  # top-level key of a dotted/array-path field spec
+        return name.split(".")[0].split("[")[0].strip()
+
+    agg: dict = {}      # structured_json key -> {type, example}
+    record: dict = {}   # raw top-level key -> {aggregatable, searchable}
+    fm_cache: dict = {}
+    step = max(1, total // sample)
+    seen = 0
+    for rid in range(1, total + 1, step):
+        row = conn.execute(
+            "SELECT structured_json, raw_json, source_path FROM documents WHERE rowid=?", (rid,)
+        ).fetchone()
+        if row is None:
+            continue
+        seen += 1
+        sp = row["source_path"]
+        fm = fm_cache.get(sp)
+        if fm is None:
+            fm = fields_for(settings, sp)
+            fm_cache[sp] = fm
+        text_fields = fm.text_fields or []
+        # A field is *searchable* iff the field map renders it into documents.text: either the
+        # source has no text_fields (whole record flattened) or the field is a text/entity field.
+        renders_all = not text_fields
+        rendered_tops = {_top(t) for t in text_fields}
+        rendered_tops |= {_top(spec.partition(":")[0]) for spec in (fm.entity_fields or [])}
+
+        sj = json.loads(row["structured_json"]) if row["structured_json"] else {}
+        for k, v in sj.items():
+            if k.startswith("__"):
+                continue
+            a = agg.setdefault(k, {"type": "list" if isinstance(v, list) else "scalar", "example": None})
+            if a["example"] is None and v not in (None, "", []):
+                a["example"] = _example(v)
+        rj = json.loads(row["raw_json"]) if row["raw_json"] else {}
+        if isinstance(rj, dict):
+            for k in rj:
+                e = record.setdefault(k, {"aggregatable": False, "searchable": False})
+                e["aggregatable"] = e["aggregatable"] or (k in sj)
+                e["searchable"] = e["searchable"] or renders_all or (k in rendered_tops)
+
+    return {
+        "documents": total,
+        "documents_sampled": seen,
+        "aggregatable_fields": agg,
+        "record_fields": {k: record[k] for k in sorted(record)},
+        "note": (
+            "aggregatable_fields → `muck aggregate --by <name>`. record_fields lists EVERY field in "
+            "the source records: `searchable: true` means it is rendered into the document text, so "
+            "`muck grep`/`muck search` find it and `muck verify` can cite it — even when "
+            "`aggregatable: false` (e.g. nested arrays like foreign_entities / conviction_disclosures "
+            "/ lobbying_activities). Grep the field name or a value. NEVER conclude a field is absent "
+            "by reasoning about the config — check here, or grep the field name directly."
+        ),
+    }
+
+
 def _entity_inertia_notice(conn) -> str | None:
     """Explain near-empty entity counts on parse-only corpora (no JSON entity_fields)."""
     ph = ",".join("?" * len(PARSER_TYPES))

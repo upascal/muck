@@ -466,6 +466,20 @@ def test_array_path_field_map_is_general(tmp_path):
     assert {r["group_value"] for r in agg.aggregate(conn, "vendor", agg="count")} == {"Acme", "Globex"}
 
 
+def test_describe_fields_separates_aggregatable_from_searchable(tmp_path):
+    """`muck fields` must show that a record field can be *searchable* without being *aggregatable*
+    — the fix for agents concluding 'that field isn't in the index'."""
+    orders = [{"order_id": "1", "vendor": "Acme", "line_items": [{"sku": "A", "dept": "eng"}]}]
+    fmap = cfg.FieldMap(record_id="order_id", structured_fields=["vendor", "line_items[].sku as sku"])
+    settings, conn = _build_anomaly_corpus(tmp_path, orders, fmap)
+    out = pipeline.describe_fields(conn, settings)
+    assert "vendor" in out["aggregatable_fields"] and "sku" in out["aggregatable_fields"]
+    rf = out["record_fields"]
+    # line_items is in the record + flattened into searchable text, but is NOT a structured column
+    assert rf["line_items"]["searchable"] and not rf["line_items"]["aggregatable"]
+    assert "NEVER conclude a field is absent" in out["note"]
+
+
 def test_content_addressed_ids_reproduce_across_paths(tmp_path):
     """The reproducibility fix: identical content at different paths → identical doc_ids/tokens,
     so a citation minted in one index resolves against an index built elsewhere."""
