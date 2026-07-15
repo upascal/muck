@@ -95,11 +95,15 @@ against an industry while taking its money, or lobbies against a bill they publi
 their chamber/committee and the money they received, around the same period. Flag contradictions."*
 **Hunt:**
 ```
+muck entity "<member>"                                         # START HERE: cross-source dossier —
+                                                               # do they appear in BOTH press and
+                                                               # contributions? that's the juxtaposition
 muck search "<member> <issue>" --person "<member>"             # what they SAY (press releases)
+muck grep "<member>" --all                                     # LD-203 filings where they're the honoree
 muck aggregate --by government_entity --agg count               # what's lobbied at their body
-muck aggregate --by <recipient> --measure amount --agg sum --resolve org   # who PAYS them
 ```
-Line the two up by entity + quarter; a mismatch is the story.
+Start with `muck entity` — if a member shows up in both a press source and a contributions source,
+that's the lead; then read both sides and line them up by quarter. A mismatch is the story.
 **Verify:** cite the public statement AND the contradicting record; both tokens must verify.
 **Generalizes to:** any corpus pairing public statements with financial disclosures.
 

@@ -1,6 +1,6 @@
 [project]
 name = "muck"
-version = "1.0.2"
+version = "1.0.3"
 description = "Modular many-document investigation pipeline for AI agents — JSON/PDF corpora, citation-verified retrieval, packaged as a Claude skill."
 readme = "README.md"
 requires-python = ">=3.11"

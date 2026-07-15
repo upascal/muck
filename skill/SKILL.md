@@ -118,6 +118,13 @@ do not treat empty search results as evidence of absence** — the corpus hasn't
 - **Entities:** `muck entities --type org --name "Acme"` to find a resolved entity, then
   `muck entities --entity <id>` to see every mention (each with a citation token) and the
   entities it co-occurs with — your cross-reference / network view.
+- **Drill down on ONE entity (context assembly):** `muck entity "<name>"` assembles a cross-source
+  dossier in one shot — where the name appears **grouped by source** (so press vs filings vs
+  contributions separate out), its resolved identity + co-occurrence network, and example citations.
+  A name present in **both** a press source **and** a contributions/filings source is a say-vs-pay /
+  follow-the-money juxtaposition to chase. Runs at query time and catches messy/unresolved variants
+  (e.g. an LD-203 honoree "Sen. Dan Sullivan"), so use it to *hone in* on a person/org across the
+  whole corpus without hand-joining.
 - **Entity + similarity:** `muck search "<query>" --person "X"` (or `--org`, `--entity <id>`)
   restricts to chunks mentioning that resolved entity and ranks them by cosine to the query;
   add `--min-score` to threshold. This is the "person = X AND semantically about Y" query.

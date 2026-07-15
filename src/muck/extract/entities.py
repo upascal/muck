@@ -279,3 +279,70 @@ def entity_detail(conn, entity_id, max_mentions=10) -> dict:
         "mentions": mentions,
         "co_occurring": neighbors,
     }
+
+
+def _source_label(source_path: str) -> str:
+    # Short, corpus-agnostic label for *where* a doc came from (last path segments distinguish
+    # e.g. .../congress_press/… from .../filings/… without hardcoding source names).
+    parts = [p for p in str(source_path).replace("\\", "/").split("/") if p]
+    return "/".join(parts[-2:]) if len(parts) >= 2 else (parts[-1] if parts else str(source_path))
+
+
+def dossier(conn, settings, name: str, examples: int = 4) -> dict:
+    """Cross-source drill-down for one entity — the "hone in on a person" view.
+
+    Assembles everything the index knows about a name into one pre-joined dossier: WHERE it's
+    named (grouped by source, so press vs filings vs contributions separate out), its resolved
+    identity + co-occurrence network, and example citations. Runs at query time over the flattened
+    text, so it catches *unresolved* name variants too (e.g. an LD-203 honoree "Sen. Dan Sullivan"
+    that never became an entity). This is the context-assembly primitive that lets an agent spot a
+    say-vs-pay / follow-the-money juxtaposition without hand-joining sources.
+    """
+    # 1. resolved identity + network (reuses the deterministic resolver as-is)
+    resolved = []
+    for etype in ("person", "org"):
+        for e in list_entities(conn, etype=etype, name=name, limit=2):
+            det = entity_detail(conn, e["entity_id"])
+            resolved.append({
+                "entity_id": e["entity_id"], "canonical_name": e["canonical_name"],
+                "type": etype, "aliases": det["aliases"],
+                "mention_count": e["mention_count"], "doc_count": e["doc_count"],
+                "co_occurring": det["co_occurring"],
+            })
+
+    # 2. cross-source appearances — FTS phrase over the (flattened) document text, grouped by source
+    fts = '"' + re.sub(r"[^\w\s]", " ", name).strip() + '"'
+    by_source, total = [], 0
+    try:
+        for r in conn.execute(
+            "SELECT d.source_path sp, COUNT(DISTINCT d.doc_id) n "
+            "FROM chunks_fts f JOIN chunks c ON c.chunk_id=f.chunk_id "
+            "JOIN documents d ON d.doc_id=c.doc_id WHERE chunks_fts MATCH ? "
+            "GROUP BY d.source_path ORDER BY n DESC",
+            (fts,),
+        ):
+            by_source.append({"source": _source_label(r["sp"]), "documents": r["n"]})
+            total += r["n"]
+    except sqlite3.OperationalError:
+        pass  # FTS unavailable or empty phrase
+
+    # 3. example citations (reuse keyword search for snippet + verifiable token)
+    from ..search import query as q
+
+    hits = q.search(conn, settings, name, mode="keyword", k=examples)
+    ex = [{"doc_id": h.doc_id, "source": _source_label(h.source_path),
+           "snippet": h.snippet, "token": h.citation.token} for h in hits]
+
+    return {
+        "query": name,
+        "documents_naming_it": total,
+        "appearances_by_source": by_source,
+        "resolved": resolved,
+        "examples": ex,
+        "note": (
+            "Drill-down dossier. `appearances_by_source` shows WHERE this entity is named — a name "
+            "present in both a press source and a contributions/filings source is a say-vs-pay / "
+            "follow-the-money juxtaposition to chase. `resolved.co_occurring` is its network. Read a "
+            "source in full with `muck read <doc_id>` and confirm any quote with `muck verify`."
+        ),
+    }

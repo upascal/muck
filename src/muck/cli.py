@@ -548,6 +548,21 @@ def entities(
     _emit(out)
 
 
+@app.command()
+def entity(
+    name: str = typer.Argument(..., help="Person/org name to drill into"),
+    examples: int = typer.Option(4, "--examples", help="Number of example citations to include"),
+):
+    """Cross-source drill-down for ONE entity: where it's named (grouped by source), its resolved
+    identity + network, and example citations. A pre-joined dossier for honing in on a person/org —
+    a name in both a press source and a contributions source is a say-vs-pay lead to verify.
+    """
+    muck_dir, settings, conn = _resolve()
+    out = entitieslib.dossier(conn, settings, name, examples=examples)
+    tracelog.log(conn, muck_dir, "entity", {"name": name}, n_results=out.get("documents_naming_it", 0))
+    _emit(out)
+
+
 finding_app = typer.Typer(no_args_is_help=True, help="Manage the findings ledger.")
 app.add_typer(finding_app, name="finding")
 

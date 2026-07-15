@@ -480,6 +480,19 @@ def test_describe_fields_separates_aggregatable_from_searchable(tmp_path):
     assert "NEVER conclude a field is absent" in out["note"]
 
 
+def test_entity_dossier_cross_source(tmp_path):
+    """The `muck entity` drill-down assembles one entity's cross-source picture: appearances by
+    source + resolved identity/network + verifiable example citations."""
+    from muck.extract import entities as ent
+
+    settings, conn = build_with_entities(tmp_path)  # filings (Acme Strategies) + a press release naming Acme
+    out = ent.dossier(conn, settings, "Acme")
+    assert out["documents_naming_it"] >= 1
+    assert out["appearances_by_source"]  # grouped by source (Acme spans filings + press)
+    assert any(r["type"] == "org" and "Acme" in r["canonical_name"] for r in out["resolved"])
+    assert out["examples"] and out["examples"][0]["token"]
+
+
 def test_content_addressed_ids_reproduce_across_paths(tmp_path):
     """The reproducibility fix: identical content at different paths → identical doc_ids/tokens,
     so a citation minted in one index resolves against an index built elsewhere."""
