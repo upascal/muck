@@ -6,7 +6,7 @@ GPU is used automatically if available.
 
 from __future__ import annotations
 
-from ..interfaces import NotInstalled
+from ..interfaces import NotInstalled, pick_torch_device
 from ..interfaces.embedder import register_embedder
 
 
@@ -18,6 +18,7 @@ class SbertEmbedder:
         self._model_name = model
         self._model = None
         self._dim: int | None = None
+        self._device: str | None = None
 
     def configure(self, cfg) -> None:
         if self._model is None and cfg.model and cfg.model != "minishlab/potion-base-8M":
@@ -31,7 +32,14 @@ class SbertEmbedder:
                 raise NotInstalled(
                     "SBERT embeddings need sentence-transformers; install `uv sync --extra sbert`"
                 ) from e
-            self._model = SentenceTransformer(self._model_name)
+            # Use the GPU if there is one (incl. Apple-Silicon MPS, which ST won't auto-pick);
+            # fall back to CPU / the library default on any failure. GPU is never required.
+            self._device = pick_torch_device()
+            try:
+                self._model = SentenceTransformer(self._model_name, device=self._device)
+            except Exception:
+                self._device = None
+                self._model = SentenceTransformer(self._model_name)
         return self._model
 
     @property
@@ -44,6 +52,9 @@ class SbertEmbedder:
         import numpy as np
 
         model = self._ensure()
+        # Larger batches keep a GPU busy; CPU stays at the conservative default.
+        if self._device in ("cuda", "mps"):
+            batch_size = max(batch_size, 256)
         vecs = np.asarray(
             model.encode(list(texts), batch_size=batch_size, normalize_embeddings=True),
             dtype="float32",

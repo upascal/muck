@@ -154,12 +154,14 @@ class SqliteStore:
         if not vec_available(conn):
             return
         self._ensure_vec_table(conn, int(vecs.shape[1]))
-        for cid, vec in zip(ids, vecs):
-            conn.execute("DELETE FROM chunks_vec WHERE chunk_id = ?", (cid,))
-            conn.execute(
-                "INSERT INTO chunks_vec(chunk_id, embedding) VALUES(?, vec_f32(?))",
-                (cid, vec.astype("float32").tobytes()),
-            )
+        ids = list(ids)
+        # Bulk DELETE-then-INSERT via executemany (one prepared statement, not a Python-level
+        # round-trip per chunk). DELETE keeps re-index idempotent; on a fresh index it no-ops.
+        conn.executemany("DELETE FROM chunks_vec WHERE chunk_id = ?", [(cid,) for cid in ids])
+        conn.executemany(
+            "INSERT INTO chunks_vec(chunk_id, embedding) VALUES(?, vec_f32(?))",
+            [(cid, vec.astype("float32").tobytes()) for cid, vec in zip(ids, vecs)],
+        )
 
     def get_vectors(self, conn, chunk_ids):
         import json

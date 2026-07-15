@@ -142,11 +142,20 @@ def parse(only_new: bool = typer.Option(True, "--only-new/--all")):
 
 
 @app.command()
-def index(only_new: bool = typer.Option(True, "--only-new/--all")):
+def index(
+    only_new: bool = typer.Option(True, "--only-new/--all"),
+    embed: bool = typer.Option(True, "--embed/--no-embed",
+                               help="--no-embed = keyword-only, skips the embedding long pole"),
+    workers: int = typer.Option(0, "--workers",
+                                help="Parallel workers (0=auto, 1=serial/deterministic)"),
+):
     """Chunk extracted documents, build the FTS5 index, and embed (if enabled)."""
     muck_dir, settings, conn = _resolve()
-    res = pipeline.run_index(conn, settings, only_new)
-    tracelog.log(conn, muck_dir, "index", {"only_new": only_new}, summary=_json.dumps(res))
+    if not embed:
+        settings.embedder.enabled = False
+    res = pipeline.run_index(conn, settings, only_new, workers=workers)
+    tracelog.log(conn, muck_dir, "index", {"only_new": only_new, "embed": embed, "workers": workers},
+                 summary=_json.dumps(res))
     _emit(res)
 
 
@@ -155,15 +164,23 @@ def build(
     paths: list[str] = typer.Argument(..., help="Files or directories to ingest and index"),
     only_new: bool = typer.Option(True, "--only-new/--all", help="Skip already-processed work"),
     cluster: bool = typer.Option(False, "--cluster", help="Also build the topical cluster index"),
+    embed: bool = typer.Option(True, "--embed/--no-embed",
+                               help="--no-embed = keyword-only fast build (skips the long pole)"),
+    workers: int = typer.Option(0, "--workers",
+                                help="Parallel workers (0=auto, 1=serial/deterministic)"),
 ):
     """Run the whole pipeline in one command — ingest → map → parse → index [→ cluster] — with
     wall-clock timing per stage. The reproducible, timed rebuild for a fresh corpus.
     """
     muck_dir, settings, conn = _resolve()
+    if not embed:
+        settings.embedder.enabled = False
     files = _expand(paths)
-    out = pipeline.build_all(conn, settings, files, only_new=only_new, cluster=cluster)
+    out = pipeline.build_all(conn, settings, files, only_new=only_new, cluster=cluster,
+                             workers=workers)
     tracelog.log(conn, muck_dir, "build",
-                 {"n_paths": len(files), "only_new": only_new, "cluster": cluster},
+                 {"n_paths": len(files), "only_new": only_new, "cluster": cluster,
+                  "embed": embed, "workers": workers},
                  summary=_json.dumps(out))
     _emit(out)
 

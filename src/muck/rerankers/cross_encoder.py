@@ -6,7 +6,7 @@ boost; enable via ``[reranker] enabled = true`` in config.
 
 from __future__ import annotations
 
-from ..interfaces import NotInstalled
+from ..interfaces import NotInstalled, pick_torch_device
 from ..interfaces.reranker import register_reranker
 
 
@@ -25,7 +25,11 @@ class CrossEncoderReranker:
                 raise NotInstalled(
                     "Reranking needs sentence-transformers; install `uv sync --extra sbert`"
                 ) from e
-            self._model = CrossEncoder(self._model_name)
+            # GPU (incl. Apple-Silicon MPS) if available; graceful CPU fallback.
+            try:
+                self._model = CrossEncoder(self._model_name, device=pick_torch_device())
+            except Exception:
+                self._model = CrossEncoder(self._model_name)
         return self._model
 
     def rerank(self, query: str, passages: list[str]) -> list[float]:

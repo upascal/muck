@@ -18,6 +18,24 @@ class NotInstalled(RuntimeError):
     """Raised when an adapter's optional dependency is not installed."""
 
 
+def pick_torch_device() -> str | None:
+    """Best available torch device for the opt-in sbert/cross-encoder path: ``cuda`` → ``mps``
+    (Apple Silicon) → ``cpu``. Returns ``None`` on any failure so the caller falls back to the
+    library default. sentence-transformers auto-picks CUDA but *not* MPS, so without this an
+    Apple-Silicon machine silently runs on CPU. Never required — GPU is a bonus, CPU always works.
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    except Exception:
+        return None
+
+
 class Registry(Generic[T]):
     """A name -> zero-arg factory map for one pipeline stage."""
 
