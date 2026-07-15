@@ -1,0 +1,3010 @@
+## User
+
+# Field report: retrieval-display and completeness failures during a real investigation
+
+**From:** a muck user (via Claude agent) running a full investigation on a real corpus
+**Corpus:** 596 archived PDFs from anna-web.org (ANNA, the ISIN standards body), pure-PDF
+(no JSON), indexed with the default stack (pdfium → 320-token chunks → FTS5 + Potion/sqlite-vec).
+Index lives at `/Users/vibes/Documents/Development/Projects/anna/.muck/index.db` if you want
+to reproduce anything below against real data.
+
+muck worked well overall — 29 findings, all `muck audit` green. But the investigation hit
+three failures worth fixing. One caused a factual error that the user caught: the agent
+reported "only one country was ever removed from ANNA membership" when the corpus actually
+records three. Root causes below, with file:line refs and suggested fixes, in priority order.
+
+---
+
+## Incident 1 (P0): hybrid hits from the vector leg show the chunk HEAD as snippet,
+## hiding the relevant text
+
+**What happened.** Query `muck search "member removed from ANNA lost membership" -k 5`
+returned the correct chunk at rank 2 (`f2035af77c6.0@1528-3479`, doc `Admin_Report_for_2017`).
+That ~1,950-char chunk contains a General Meeting resolution suspending the Nairobi Stock
+Exchange and Libyan Stock Market — the exact answer. But the chunk *starts* with an unrelated
+resolution about vote-counting, and the displayed snippet was the first 220 chars. The agent
+judged the hit irrelevant from the snippet and discarded it. Retrieval succeeded; display
+buried the evidence.
+
+**Root cause.** `src/muck/search/query.py:56`:
+
+    snippet = snippets.get(cid) or (r["text"][:220].strip() + ...)
+
+BM25 hits get a proper query-centered FTS5 snippet (`src/muck/stores/sqlite_store.py:77`,
+`snippet(chunks_fts, 0, ...)`). But in hybrid mode, a hit surfaced by the *vector* leg that
+isn't also in the BM25 result pool has no entry in `snippets`, so it falls back to the chunk
+head. Head-of-chunk is uncorrelated with why the vector leg matched it. (Confirmed: the
+displayed snippet had no `[...]` FTS5 match markers — it was the fallback path.)
+
+**Suggested fix.** Replace the fallback with a query-relevant window:
+- Cheap + effective: split the chunk into sentences, embed them with the already-loaded
+  embedder, take the window around the sentence most similar to the query vector. Potion
+  embeds are ~microseconds per sentence; this adds negligible latency at k≤20.
+- Cheaper still (no embeds): center the snippet on the sentence with maximum content-word
+  overlap with the query. Even this would have surfaced "suspension of their
+  partnership/membership … Nairobi Stock Exchange & Libyan Stock Market".
+- Either way, reuse `_snippet(text, around=...)` from `sqlite_store.py:41`, which already
+  implements match-centered windowing for grep.
+
+**Acceptance test.** On this corpus:
+`muck search "member removed from ANNA lost membership" -k 5` → the Admin_Report_for_2017
+hit's snippet must contain "Nairobi" (currently it shows vote-counting text).
+
+---
+
+## Incident 2 (P0): `grep` silently truncates at k, in arbitrary order, with no total count
+
+**What happened.** The user asked "which countries were rescinded or barred from membership"
+— an *enumeration* question. The agent ran `muck grep "suspend" -k 6`-style sweeps and
+treated the k results as the full universe, then asserted "no other country was named."
+Wrong: the Kenya/Libya chunk matched but wasn't in the first k rows.
+
+**Root cause.** `src/muck/stores/sqlite_store.py:87-95`: `... WHERE regexp(?, c.text) LIMIT ?`
+— rows come back in table order (effectively rowid), so `-k` isn't even "top k by relevance",
+it's "first k by insertion order". And `query.py:188` returns just the hits — the caller
+cannot tell 6-of-6 from 6-of-600.
+
+**Suggested fixes (all three are small):**
+1. Add `total_matches` to grep output (run a `COUNT(*)` alongside, or fetch k+1 and flag
+   truncation). The JSON the agent sees must make truncation visible — silent caps read as
+   "covered everything".
+2. Add `--all` (or `-k 0`) to return every match; enumeration questions need it.
+3. Document in SKILL.md that grep is capped and unordered, and that enumeration/completeness
+   questions require `--all` + grouping by doc, never a top-k slice.
+
+**Acceptance test.** `muck grep "suspen" -k 5` on this corpus returns 5 hits AND
+`"total_matches": 16` (verified: the uncapped count here is 16 across 9 docs).
+
+---
+
+## Incident 3 (P1): literal-phrase grep fails across PDF line breaks
+
+**What happened.** `muck grep "Libyan Stock Market"` returned only directory-listing hits,
+missing the key resolution — because the source PDF renders it as `"Libyan \r\nStock Market"`.
+Meanwhile `muck verify` happily verified a quote spanning that same break, because
+`cite.py:82` normalizes `\s+` → single space. The two tools disagree about whitespace, and
+the strict one is the discovery tool — the worst place for strictness.
+
+**Suggested fix.** In `SqliteStore.grep`, translate literal space runs in the pattern to
+`\s+` before matching (both in the `regexp()` UDF filter and the per-row `re.search`), or add
+a `--phrase` flag that does so. This makes grep's matching semantics consistent with verify's
+quote normalization. PDF-extracted text guarantees mid-phrase `\r\n`; every phrase search
+against a parsed-PDF corpus currently has silent false negatives.
+
+**Acceptance test.** `muck grep "Libyan Stock Market"` on this corpus must return the
+`Admin_Report_for_2017` chunk (`f2035af77c6.0@1528-3479`).
+
+---
+
+## Incident 4 (P2): entity resolution is inert on pure-PDF corpora, silently
+
+`muck index` on this 596-doc corpus reported `entities: 4, mentions: 8`. Per
+`src/muck/extract/entities.py:3-4`, mentions come only from (a) a gazetteer built from JSON
+`entity_fields` and (b) bill-number regex. A parse-only corpus has neither, so
+`--person/--org` filtering and the entity network are dead weight — with no warning.
+Also: `pyproject.toml:23` declares a `spacy` extra that is never imported anywhere.
+
+**Suggested fixes:**
+1. Minimum: when `index` finishes with ~0 entities on a corpus with parsed docs, emit a
+   `notice` in the JSON explaining why and what still works (search/grep/aggregate/cluster).
+2. Better: wire the declared-but-unused spacy extra into an optional NER mention extractor
+   for parsed text, feeding the existing resolver. (Or delete the extra — it currently
+   promises capability that doesn't exist.)
+
+---
+
+## SKILL.md additions (method, not code)
+
+The agent-side lessons from the same incidents — encode them so other agents don't repeat:
+- "Before dismissing a search hit, read `citation.quote` (the full chunk), not `snippet`.
+  The snippet is a preview, not the evidence."
+- "For enumeration questions ('list all X', 'which countries...'), never bound the answer
+  with ranked top-k results. Use `grep --all`, group by document, and read every hit.
+  Absence from a top-k list is not evidence of absence."
+- "Corpus vocabulary check: search the corpus's own terms for an action before concluding
+  it never happened (this corpus said 'suspension', not 'termination/expulsion/barred')."
+
+## Verification of any fix, end to end
+
+Re-run the failed investigation question against this corpus after changes:
+`muck search "which stock exchanges had their ANNA membership suspended" -k 8` and
+`muck grep "suspension of their" --all` should together surface Philippines (2013
+termination, `fcdba353ed7.0@29499-31344`), and Kenya + Libya (2017 suspension,
+`f2035af77c6.0@1528-3479`) — with snippets that make their relevance visible without
+reading the full chunk.
+
+## Assistant
+
+I'll dig into the muck codebase to understand the four incidents in this field report, then put together a fix plan. Starting with parallel exploration of the search/display path and the CLI/entities/skill surface.
+
+**Tool Call: Explore muck search/snippet/grep path**
+Status: Completed
+
+I now have a complete picture. Here is the structured report.
+
+---
+
+# muck codebase map: search/display bug field report
+
+All paths absolute. Line numbers verified against current file contents. The store layer has two implementations but only `SqliteStore` (`sqlite-fts5`) defines snippets/grep/BM25; `TurbovecStore` subclasses it and overrides only the vector methods, so everything in sections 1-3 applies to both backends.
+
+---
+
+## 1. Hybrid search snippet path
+
+File: `/Users/vibes/Documents/Development/Projects/muck/src/muck/search/query.py`
+
+The `snippet` is assigned in `_build_hits` at **line 56** (exactly as the report says):
+
+```python
+56  snippet = snippets.get(cid) or (r["text"][:220].strip() + ("…" if len(r["text"]) > 220 else ""))
+```
+
+`snippets` is a `dict[cid -> str]` that is populated **only by the BM25 leg**. The vector leg never contributes to it. So any chunk surfaced by the vector leg but absent from the BM25 pool falls through to the chunk-head fallback (`r["text"][:220]`) — this is the bug locus.
+
+### Where `snippets` comes from — `search()` (lines 73-115)
+
+```python
+73  def search(conn, settings: Settings, query: str, mode: str = "auto", k: int = 8, filters=None) -> list[Hit]:
+74      store = get_store(settings.store.backend)
+75      has_vec = _vectors_ready(conn, settings, store)
+76      if mode == "auto":
+77          mode = "hybrid" if has_vec else "keyword"
+78
+79      rerank_on = settings.reranker.enabled
+80      pool = max(k * 5, 20) if rerank_on else k  # rerank a wider candidate set, then trim
+81
+82      bm_ids: list[str] = []
+83      vec_ids: list[str] = []
+84      snippets: dict[str, str] = {}
+85
+86      if mode in ("keyword", "hybrid"):
+87          bm_res = store.search_bm25(conn, query, pool, filters)
+88          bm_ids = [cid for cid, _, _ in bm_res]
+89          snippets = {cid: snip for cid, _, snip in bm_res}   # <-- ONLY BM25 fills snippets
+90
+91      if mode in ("semantic", "hybrid") and has_vec:
+92          emb = build_embedder(settings)
+93          qvec = emb.embed([query])[0]
+94          vec_ids = [cid for cid, _ in store.search_vector(conn, qvec, pool, filters)]  # <-- no snippet
+95
+96      if mode == "keyword":
+97          ordered = bm_ids
+98      elif mode == "semantic":
+99          ordered = vec_ids
+100     else:
+101         ordered = _rrf([bm_ids, vec_ids])
+102
+103     hits = _build_hits(conn, ordered[:pool], snippets, mode)
+104
+105     if rerank_on and hits:
+106         from ..interfaces.reranker import get_reranker
+107
+108         reranker = get_reranker(settings.reranker.name)
+109         scores = reranker.rerank(query, [h.citation.quote for h in hits])
+110         for h, s in zip(hits, scores):
+111             h.score = float(s)
+112             h.match_mode = f"{mode}+rerank"
+113         hits.sort(key=lambda h: h.score, reverse=True)
+114
+115     return hits[:k]
+```
+
+Key observations for the fix:
+- **Snippet dict is BM25-only** (line 89). In `semantic` mode `snippets` stays `{}` entirely, so *every* hit gets the chunk-head fallback. In `hybrid` mode, only chunks that were also in the BM25 pool get a match-centered FTS snippet; vector-only chunks get the chunk-head.
+- **RRF merge** is in `_rrf` (lines 28-33): standard reciprocal-rank fusion, `k0=60`, over the two ordered id lists. It returns ids sorted by fused score; it does not touch snippets.
+- An embedder is already built and the **query vector `qvec` is already computed** at line 92-93 in hybrid/semantic mode — available to re-embed a few candidate sentences for a better snippet if desired (see section 4).
+
+### `_build_hits` — result row fields + final shape (lines 36-70)
+
+```python
+36  def _build_hits(conn, ordered_ids, snippets, mode) -> list[Hit]:
+37      if not ordered_ids:
+38          return []
+39      placeholders = ",".join("?" * len(ordered_ids))
+40      rows = conn.execute(
+41          f"SELECT c.chunk_id, c.doc_id, c.text, c.char_start, c.char_end, c.locator, "
+42          f"d.source_path, d.title FROM chunks c JOIN documents d ON d.doc_id=c.doc_id "
+43          f"WHERE c.chunk_id IN ({placeholders})",
+44          ordered_ids,
+45      ).fetchall()
+46      by_id = {r["chunk_id"]: r for r in rows}
+47      hits = []
+48      for rank, cid in enumerate(ordered_ids):
+49          r = by_id.get(cid)
+50          if r is None:
+51              continue
+52          citation = make_citation(
+53              r["doc_id"], r["source_path"], r["locator"],
+54              r["char_start"], r["char_end"], r["text"],
+55          )
+56          snippet = snippets.get(cid) or (r["text"][:220].strip() + ("…" if len(r["text"]) > 220 else ""))
+57          hits.append(
+58              Hit(
+59                  chunk_id=cid,
+60                  doc_id=r["doc_id"],
+61                  doc_title=r["title"],
+62                  source_path=r["source_path"],
+63                  locator=r["locator"],
+64                  score=1.0 / (1 + rank),
+65                  match_mode=mode,
+66                  snippet=snippet,
+67                  citation=citation,
+68              )
+69          )
+70      return hits
+```
+
+- A result **row** (`r`) carries: `chunk_id`, `doc_id`, `text` (full chunk text), `char_start`, `char_end`, `locator`, `source_path`, `title`. Note: the full chunk `text` is available here — a match-centered snippet could be recomputed locally without another DB round-trip.
+- `make_citation` (see `cite.py` lines 42-53) sets `citation.quote = span = r["text"]` — i.e. **the citation quote is the entire chunk text**, not the snippet. So `h.citation.quote` (used by the reranker at line 109) is the full chunk, and the JSON `citation.quote` field is the full chunk text.
+
+### Final result JSON shape
+
+Emitted by `Hit.to_dict()` in `/Users/vibes/Documents/Development/Projects/muck/src/muck/schema.py` (lines 103-114), each hit is:
+
+```python
+{
+  "chunk_id": ...,
+  "doc_id": ...,
+  "doc_title": ...,
+  "source_path": ...,
+  "locator": ...,
+  "score": round(self.score, 4),
+  "match_mode": ...,          # "keyword" | "semantic" | "hybrid" | "grep" | "<mode>+rerank"
+  "snippet": ...,             # the possibly-degraded field from line 56
+  "citation": {               # Citation.to_dict(), lines 77-86
+    "doc_id", "source_path", "locator",
+    "char_start", "char_end",
+    "quote",                  # == FULL chunk text (span), not the snippet
+    "token"
+  }
+}
+```
+
+So yes: the JSON includes `citation.quote` which is the **full chunk text**, alongside the separate (sometimes chunk-head) `snippet`.
+
+`score` note: after `_build_hits`, `score = 1.0/(1+rank)` (rank order), unless the reranker is on (lines 105-113), which overwrites it with the reranker score and re-sorts.
+
+---
+
+## 2. FTS5 snippet generation
+
+File: `/Users/vibes/Documents/Development/Projects/muck/src/muck/stores/sqlite_store.py`
+
+### BM25 query + FTS5 `snippet()` — `search_bm25` (lines 70-85)
+
+```python
+70  def search_bm25(self, conn, query, k, filters=None):
+71      match = _fts_safe(query)
+72      if not match:
+73          return []
+74      where, params = _filter_sql(filters)
+75      sql = (
+76          "SELECT f.chunk_id AS chunk_id, bm25(chunks_fts) AS score, "
+77          "snippet(chunks_fts, 0, '[', ']', '…', 14) AS snip "
+78          "FROM chunks_fts f "
+79          "JOIN chunks c ON c.chunk_id = f.chunk_id "
+80          "JOIN documents d ON d.doc_id = c.doc_id "
+81          "WHERE chunks_fts MATCH ?" + where + " ORDER BY score LIMIT ?"
+82      )
+83      rows = conn.execute(sql, [match, *params, k]).fetchall()
+84      # bm25() returns lower = better; flip so higher = better.
+85      return [(r["chunk_id"], -float(r["score"]), r["snip"]) for r in rows]
+```
+
+- The snippet comes from SQLite FTS5 `snippet(chunks_fts, 0, '[', ']', '…', 14)`: column 0, open/close markers `[`…`]`, ellipsis `…`, and **max 14 tokens** of context. This is match-aware (built around the MATCH terms) — which is exactly why vector-only hits (no MATCH) cannot get one from this path.
+- Returns a list of `(chunk_id, score, snippet)` tuples. `_fts_safe` (lines 15-18) tokenizes on `[\w'-]+` and quotes each term (AND semantics).
+
+### `_snippet(text, around=..., width=220)` — match-centered windowing used by grep (lines 41-48)
+
+```python
+41  def _snippet(text: str, around: str | None = None, width: int = 220) -> str:
+42      if around:
+43          m = re.search(re.escape(around), text, re.IGNORECASE)
+44          if m:
+45              lo = max(0, m.start() - width // 2)
+46              hi = min(len(text), m.end() + width // 2)
+47              return ("…" if lo else "") + text[lo:hi].strip() + ("…" if hi < len(text) else "")
+48      return text[:width].strip() + ("…" if len(text) > width else "")
+```
+
+This is the reusable helper that centers a `width`-char window on a matched substring (`around`), falling back to a chunk-head window when there is no match. Note line 48's fallback is the same chunk-head logic duplicated inline at `query.py:56` — relevant if you want a single shared snippet routine. This function is currently only called by `grep` (line 98), not by the vector/hybrid path.
+
+---
+
+## 3. Grep implementation
+
+### Store-level grep SQL + per-row re.search — `SqliteStore.grep` (lines 87-99)
+
+File: `/Users/vibes/Documents/Development/Projects/muck/src/muck/stores/sqlite_store.py`
+
+```python
+87  def grep(self, conn, pattern, k, filters=None):
+88      where, params = _filter_sql(filters)
+89      sql = (
+90          "SELECT c.chunk_id AS chunk_id, c.text AS text FROM chunks c "
+91          "JOIN documents d ON d.doc_id = c.doc_id "
+92          "WHERE regexp(?, c.text)" + where + " LIMIT ?"
+93      )
+94      rows = conn.execute(sql, [pattern, *params, k]).fetchall()
+95      out = []
+96      for r in rows:
+97          m = re.search(pattern, r["text"], re.IGNORECASE)
+98          out.append((r["chunk_id"], _snippet(r["text"], m.group(0) if m else None)))
+99      return out
+```
+
+- SQL: `WHERE regexp(?, c.text) ... LIMIT ?`. **No `ORDER BY`** — ordering is whatever SQLite yields (effectively `chunks` rowid / insertion order), truncated at `k`. There is no relevance ranking for grep.
+- Per-row `re.search(pattern, r["text"], re.IGNORECASE)` (line 97) recomputes the match to feed `_snippet` a match-centered window. The `m.group(0)` (first match text) is the `around` arg. **Only the first match** is windowed; offsets of the match are not returned to the caller (only `chunk_id` + snippet string). Note the regexp UDF and this per-row search both hardcode `re.IGNORECASE`.
+- Returns list of `(chunk_id, snippet)` tuples (2-tuples, unlike BM25's 3-tuples).
+
+### `regexp` UDF registration — `/Users/vibes/Documents/Development/Projects/muck/src/muck/db.py` (lines 193-217)
+
+```python
+193  @lru_cache(maxsize=256)
+194  def _compiled(pattern: str) -> re.Pattern:
+195      return re.compile(pattern, re.IGNORECASE)
+196
+197
+198  def _regexp(pattern: str, value: str | None) -> int:
+199      if value is None:
+200          return 0
+201      return 1 if _compiled(pattern).search(value) else 0
+...
+204  def connect(db_path: str | Path) -> sqlite3.Connection:
+205      conn = sqlite3.connect(str(db_path))
+206      conn.row_factory = sqlite3.Row
+207      conn.execute("PRAGMA journal_mode=WAL")
+208      conn.create_function("regexp", 2, _regexp, deterministic=True)   # <-- UDF registered here
+...
+```
+
+The UDF is a 2-arg `regexp(pattern, value)` → 0/1, compiled with `re.IGNORECASE` (cached, maxsize 256). Registered as `deterministic=True` on every `connect()`.
+
+### Grep caller — `query.grep` (lines 188-193)
+
+File: `/Users/vibes/Documents/Development/Projects/muck/src/muck/search/query.py`
+
+```python
+188  def grep(conn, settings: Settings, pattern: str, k: int = 20, filters=None) -> list[Hit]:
+189      store = get_store(settings.store.backend)
+190      res = store.grep(conn, pattern, k, filters)
+191      ids = [cid for cid, _ in res]
+192      snippets = {cid: snip for cid, snip in res}
+193      return _build_hits(conn, ids, snippets, "grep")
+```
+
+Returns `list[Hit]` with `match_mode="grep"`; snippets here are always match-centered (from `_snippet`), so grep does **not** suffer the section-1 fallback problem. Same `Hit`/`citation.quote=full chunk` JSON shape.
+
+### CLI wiring
+
+File: `/Users/vibes/Documents/Development/Projects/muck/src/muck/cli.py`
+
+`muck grep` command (lines 180-192):
+
+```python
+180  @app.command()
+181  def grep(
+182      pattern: str,
+183      k: int = typer.Option(20, "-k", "--k"),
+184      doc_type: str = typer.Option(None),
+185      doc_id: str = typer.Option(None),
+186  ):
+187      """Regex search for exact strings (bill numbers, names, IDs)."""
+188      muck_dir, settings, conn = _resolve()
+189      hits = query_mod.grep(conn, settings, pattern, k, _filters(doc_type, doc_id, None))
+190      out = [h.to_dict() for h in hits]
+191      tracelog.log(conn, muck_dir, "grep", {"pattern": pattern, "k": k}, n_results=len(out))
+192      _emit(out)
+```
+
+- Flags: positional `pattern`; `-k/--k` (default **20**); `--doc-type` (default None); `--doc-id` (default None). No `path_like` for grep (passes `None` at line 189).
+
+`muck search` command (lines 143-177):
+
+```python
+143  @app.command()
+144  def search(
+145      query: str = typer.Argument("", help="..."),
+146      k: int = typer.Option(8, "-k", "--k"),
+147      mode: str = typer.Option("auto", help="auto|keyword|semantic|hybrid"),
+148      doc_type: str = typer.Option(None),
+149      doc_id: str = typer.Option(None),
+150      path_like: str = typer.Option(None, help="SQL LIKE filter on source path"),
+151      person: str = typer.Option(None, "--person", help="..."),
+152      org: str = typer.Option(None, "--org", help="..."),
+153      entity: str = typer.Option(None, "--entity", help="..."),
+154      min_score: float = typer.Option(None, "--min-score", help="Min cosine similarity [0..1]"),
+155  ):
+...
+161      muck_dir, settings, conn = _resolve()
+162      if person or org or entity:
+163          kwargs = {"k": k, "min_score": min_score}
+...
+170          hits = query_mod.search_in_entity(conn, settings, query, **kwargs)
+...
+173          hits = query_mod.search(conn, settings, query, mode, k, _filters(doc_type, doc_id, path_like))
+...
+175      out = [h.to_dict() for h in hits]
+176      tracelog.log(conn, muck_dir, "search", logargs, n_results=len(out))
+177      _emit(out)
+```
+
+- search flags: positional `query` (default `""`); `-k/--k` (default **8**); `--mode` (default `auto`); `--doc-type`; `--doc-id`; `--path-like`; `--person`; `--org`; `--entity`; `--min-score`. When `--person/--org/--entity` set, routes to `search_in_entity` (cosine-in-entity path).
+
+**Output rendering** — always JSON. `_emit` (lines 58-59):
+
+```python
+58  def _emit(obj) -> None:
+59      typer.echo(_json.dumps(obj, indent=2, default=str))
+```
+
+Both `search` and `grep` emit `[h.to_dict() for h in hits]` as a pretty-printed JSON array (indent=2). No table rendering anywhere in the CLI. `texttable` is present in `.venv` but is not imported by the muck source.
+
+---
+
+## 4. Embedder access
+
+### Loader — `/Users/vibes/Documents/Development/Projects/muck/src/muck/embedders/__init__.py` (lines 18-28)
+
+```python
+18  def build_embedder(settings):
+19      if not settings.embedder.enabled:
+20          return None
+21      cfg = settings.embedder
+22      key = (cfg.name, cfg.model, cfg.api_key_env)
+23      if key not in _CACHE:
+24          emb = get_embedder(cfg.name)
+25          if hasattr(emb, "configure"):
+26              emb.configure(cfg)
+27          _CACHE[key] = emb
+28      return _CACHE[key]
+```
+
+- Single construction path, **process-cached** per `(name, model, api_key_env)` — the model loads once. Returns `None` if embeddings are disabled.
+
+### Default embedder — `/Users/vibes/Documents/Development/Projects/muck/src/muck/embedders/potion_embedder.py`
+
+Potion (model2vec static embeddings, CPU-only, L2-normalized). The `embed` signature (lines 43-53):
+
+```python
+43  def embed(self, texts: list[str], batch_size: int = 256):
+44      import numpy as np
+45      model = self._ensure()
+46      vecs = np.asarray(model.encode(list(texts)), dtype="float32")
+47      if vecs.ndim == 1:
+48          vecs = vecs.reshape(1, -1)
+49      norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+50      norms[norms == 0] = 1.0
+51      self._dim = vecs.shape[-1]
+52      return vecs / norms
+```
+
+- The model is lazy-loaded via `_ensure()` (line 26-35) — `StaticModel.from_pretrained(...)` on first `embed`/`dim`. `dim` property (lines 37-41) triggers a probe embed if unknown.
+- Interface (`/Users/vibes/Documents/Development/Projects/muck/src/muck/interfaces/embedder.py`, lines 13-21): `Embedder.embed(texts: list[str], batch_size=256) -> np.ndarray` of shape `(N, dim)`, float32.
+
+### Where the query vector is computed (search time)
+
+`/Users/vibes/Documents/Development/Projects/muck/src/muck/search/query.py`:
+
+- **`search()`** lines 91-94 (hybrid/semantic modes only):
+  ```python
+  91  if mode in ("semantic", "hybrid") and has_vec:
+  92      emb = build_embedder(settings)
+  93      qvec = emb.embed([query])[0]
+  94      vec_ids = [cid for cid, _ in store.search_vector(conn, qvec, pool, filters)]
+  ```
+- **`search_in_entity()`** lines 158-170 builds an embedder and embeds candidate chunk texts + the query for true cosine ranking (`qvec = np.asarray(emb.embed([query])[0], ...)` at line 170).
+
+**Relevance to the snippet fix:** Yes — an embedder is readily available at search time (`build_embedder(settings)`), and `emb.embed([...])` accepts an arbitrary list of strings. Since Potion is CPU-only/static, embedding a handful of candidate sentences per vector-only hit to pick a best-matching snippet window is cheap. The full chunk `text` is already in-hand in `_build_hits` (row field `r["text"]`), and the query vector `qvec` is already computed in `search()` — but note `qvec` is currently a local in `search()` and is **not passed into `_build_hits`** (its signature is `(conn, ordered_ids, snippets, mode)`), so wiring it through would be required.
+
+---
+
+## 5. Verify / cite whitespace normalization
+
+File: `/Users/vibes/Documents/Development/Projects/muck/src/muck/cite.py`
+
+### Quote normalization — `_norm` (lines 81-82)
+
+```python
+81  def _norm(s: str) -> str:
+82      return re.sub(r"\s+", " ", s).strip().casefold()
+```
+
+Collapses any run of whitespace to a single space, strips ends, and casefolds. Used for the quote-support substring check.
+
+### Verify flow — `verify` (lines 121-127) and its dependency `resolve` (lines 85-118)
+
+```python
+121  def verify(conn: sqlite3.Connection, settings: Settings, token: str, quote: str) -> dict:
+122      r = resolve(conn, settings, token)
+123      if not r.get("token_valid"):
+124          return {**r, "quote": quote, "quote_supported": False, "verified": False}
+125      quote_supported = _norm(quote) in _norm(r["span"]) if quote else False
+126      verified = bool(quote_supported and r.get("source_confirmed") is not False)
+127      return {**r, "quote": quote, "quote_supported": quote_supported, "verified": verified}
+```
+
+Flow:
+1. `resolve(conn, settings, token)` (lines 85-118): parses the token (`doc@start-end#hash`), loads the document row, slices `span = stored_text[start:end]`, and recomputes the hash → `token_valid` (line 96). It also re-derives text from the **original source file** via `reextract_doc_text` (lines 64-78) and sets `source_confirmed = (src_text[start:end] == span)` (line 101). `valid = token_valid and (source_confirmed is not False)` (line 117).
+2. `verify` short-circuits to unverified if `token_valid` is false (lines 123-124).
+3. Otherwise `quote_supported = _norm(quote) in _norm(r["span"])` (line 125) — the whitespace-normalized, casefolded substring test. Empty quote → `False`.
+4. `verified = quote_supported AND source_confirmed is not False` (line 126). Note: `source_confirmed is None` (source file missing) still passes the `is not False` guard.
+
+Relevance to display bugs: `_norm` only normalizes whitespace + case. If a displayed snippet inserts characters that are not whitespace (e.g. the FTS `[`…`]` match markers or `…` ellipsis from section 2), a user copying the *snippet* text as a quote would fail `quote_supported`, because `_norm` does not strip `[`, `]`, or `…`. The `citation.quote` field (full chunk, section 1) is the safe thing to verify against; the `snippet` is not.
+
+---
+
+## 6. Tests
+
+Directory: `/Users/vibes/Documents/Development/Projects/muck/tests/`
+
+- **Single test module:** `/Users/vibes/Documents/Development/Projects/muck/tests/test_pipeline_e2e.py` (571 lines). No `conftest.py` anywhere in the repo (outside `.venv`).
+- **Fixtures (static, no builder script):** `/Users/vibes/Documents/Development/Projects/muck/tests/fixtures/` contains `lobbying_sample.json`, `firms_filings.json`, `press_release.txt`, `external_orgs.json`. There is no generator; these are checked-in sample files.
+
+### Fixture corpus builders (helper functions inside the test file, not a separate module)
+
+- `build(tmp_path, embeddings)` — lines 28-44: copies `["lobbying_sample.json", "press_release.txt"]` into a temp corpus, writes default config, runs `ingest → extract(MAPPER) → extract(PARSER) → run_index`. Used by the core search/cite tests.
+- `build_with_entities(tmp_path, embeddings=False)` — lines 93-115: same two files but with an explicit `FieldMap` (entity fields `registrant:org`, `client:org`, `lobbyists:person`), used by entity/cosine/recall/aggregate tests.
+- `build_firms(tmp_path)` — lines 364-382: only `firms_filings.json`, entity resolution off; used by reconcile/aggregate/read tests.
+
+### Tests relevant to your report areas
+
+Search / snippets / hybrid:
+- `test_pipeline_and_citation_guard` (lines 47-74): runs `q.search(..., "keyword", 5)`, asserts a hit + citation token, then exercises verify (real quote, fabricated quote, tampered token). This is the closest thing to a snippet/search assertion, but it checks `citation.quote`, **not** the `snippet` field. **No test currently asserts anything about `Hit.snippet` content in any mode.**
+- `test_embedding_path_optional` (lines 562-570): `q.search(..., "semantic", 3)` — asserts hits exist (semantic recall), skips if the model can't load. Again does not assert on `snippet`.
+- Entity-filtered cosine search: `test_entity_search_uses_stored_vectors` (316-336), `test_entity_filtered_cosine_search` (339-361) — exercise `search_in_entity` (which passes `snippets={}` → all chunk-head snippets), asserting only on `chunk_id` membership and `score` ordering.
+
+Grep:
+- `test_grep_exact_string` (lines 77-81): `q.grep(conn, settings, r"H\.R\. 1234", 10)`, asserts `>= 2` hits and every hit has a citation token. Does not assert snippet windowing.
+
+Cite / verify:
+- `test_pipeline_and_citation_guard` (47-74): full verify matrix (valid/quote-supported/verified, fabricated quote unsupported, tampered `#hash` rejected).
+- `test_findings_ledger_and_audit` (138-152) and `test_batch_read_full_docs` (429-452) call `citelib.verify(...)` indirectly through the findings/reader layers.
+
+Vector store round-trip (relevant to embed-at-search-time ideas):
+- `test_get_vectors_roundtrip` (294-313): confirms stored chunk vectors can be read back by `get_store("sqlite-fts5").get_vectors(...)` — i.e. search can reuse persisted vectors instead of re-embedding.
+
+**Coverage gap to note for your plan:** there is no test that asserts the *content/shape* of `Hit.snippet` for hybrid or semantic mode (i.e., nothing pins the current chunk-head fallback behavior, so a fix that improves vector-only snippets won't break an existing assertion). Grep snippets and citation quotes are the only display-adjacent things under test.
+
+---
+
+### Cross-file summary of the bug locus
+
+- Root cause: `snippets` is populated **only** from `store.search_bm25` (`query.py:89`), whose snippet is FTS5-match-centered; vector-only hits reach `_build_hits` with no entry and hit the chunk-head fallback (`query.py:56`).
+- Reusable machinery already present: `_snippet(text, around, width)` (`sqlite_store.py:41-48`) does match-centered windowing; `build_embedder(settings)` + `emb.embed([...])` is cheap (Potion, CPU); full chunk `text` and `qvec` are already available in the `search()`/`_build_hits` call path (though `qvec` is not currently threaded into `_build_hits`).
+
+**Tool Call: Explore muck entities, CLI, SKILL.md**
+Status: Completed
+
+I have everything needed. Here is the structured field-report map.
+
+---
+
+# muck codebase map for field-report fixes
+
+Absolute repo root: `/Users/vibes/Documents/Development/Projects/muck`. Package uses src layout under `src/muck/`. CLI framework is **Typer**. Note: `skill/SKILL.md` and the installed `~/.claude/skills/muck/SKILL.md` are currently **byte-identical** (7222 bytes) — edits to the repo copy must be re-synced to the installed copy.
+
+---
+
+## 1. Entity extraction pipeline
+
+**File: `src/muck/extract/entities.py`**
+
+The module docstring itself states the exact limitation the report flags (lines 1-8):
+
+```python
+"""Entity extraction + resolution (Phase 1).
+
+Mentions come from (a) a gazetteer built from the clean structured ``entity_fields`` of
+JSON records and (b) bill-number regex over free text — both scanned against chunk text
+so every mention carries exact char offsets (a verifiable citation). Resolution groups
+surface forms by a deterministic normalized key (corporate-suffix stripping merges
+"Acme Strategies LLC" with "Acme Strategies, L.L.C."), the reusable "entity resolver".
+"""
+```
+
+**The only two mention sources** — a gazetteer regex and a bill-number regex:
+
+- `BILL_RE` (lines 28-31):
+```python
+BILL_RE = re.compile(
+    r"\b(?:H\.?\s?R\.?|S\.?J\.?\s?Res\.?|H\.?J\.?\s?Res\.?|S\.?)\s?\d{1,6}\b",
+    re.IGNORECASE,
+)
+```
+
+- `_gazetteer(conn)` (lines 50-62) — builds the gazetteer **only from `documents.structured_json` → `__entities__`**. Parsed PDFs/DOCX/TXT have no `structured_json` (see §3), so they contribute **zero** gazetteer entries. If no JSON records exist, `gaz` is empty and the returned pattern is `None`:
+```python
+def _gazetteer(conn) -> tuple[dict[str, str], re.Pattern | None]:
+    gaz: dict[str, str] = {}
+    for row in conn.execute("SELECT structured_json FROM documents WHERE structured_json IS NOT NULL"):
+        ents = json.loads(row[0]).get("__entities__") or []
+        for e in ents:
+            name = str(e.get("name", "")).strip()
+            if name:
+                gaz.setdefault(name.lower(), e.get("type", "org"))
+    if not gaz:
+        return gaz, None
+    names = sorted({n for n in gaz}, key=len, reverse=True)
+    pattern = re.compile(r"(?<!\w)(" + "|".join(re.escape(n) for n in names) + r")(?!\w)", re.IGNORECASE)
+    return gaz, pattern
+```
+
+**Main entry point: `build_entities(conn, settings)` (lines 65-136)** — full idempotent rebuild. It scans every chunk (line 78) and applies only `gaz_re` (lines 81-84) and `BILL_RE` (lines 85-86):
+```python
+    for ch in conn.execute("SELECT chunk_id, doc_id, text, char_start, locator FROM chunks"):
+        text, base = ch["text"], ch["char_start"]
+        spans: list[tuple[str, str, int, int]] = []  # (raw, type, start, end)
+        if gaz_re:
+            for m in gaz_re.finditer(text):
+                raw = m.group(1)
+                spans.append((raw, gaz.get(raw.lower(), "org"), m.start(1), m.end(1)))
+        for m in BILL_RE.finditer(text):
+            spans.append((m.group(0), "bill", m.start(), m.end()))
+```
+So for a **pure-PDF corpus** (no `__entities__`, `gaz_re is None`), the *only* mentions produced are bill numbers. There is no NER, no capitalized-name heuristic, nothing else for free text. `build_entities` returns its own summary counts (line 136):
+```python
+    return {"entities": len(groups), "mentions": n_mentions, "edges": len(edge_w)}
+```
+
+**Resolver logic** — `normalize_key(name, etype)` (lines 34-43) plus `ORG_SUFFIXES` (lines 23-26); grouping/canonical-form selection at lines 100-123.
+
+**Query entry points** (used by the `entities` CLI command): `list_entities(...)` (lines 141-162) and `entity_detail(...)` (lines 165-208).
+
+**Where `muck index` invokes it** — `src/muck/pipeline.py`, `run_index(...)`, lines 280-283 (gated on `settings.entities.resolve`, default `True` per `config.py:71`):
+```python
+    if settings.entities.resolve:
+        from .extract.entities import build_entities
+
+        result["entity_index"] = build_entities(conn, settings)
+```
+
+**CLI wiring** — `src/muck/cli.py` lines 116-122:
+```python
+@app.command()
+def index(only_new: bool = typer.Option(True, "--only-new/--all")):
+    """Chunk extracted documents, build the FTS5 index, and embed (if enabled)."""
+    muck_dir, settings, conn = _resolve()
+    res = pipeline.run_index(conn, settings, only_new)
+    tracelog.log(conn, muck_dir, "index", {"only_new": only_new}, summary=_json.dumps(res))
+    _emit(res)
+```
+
+**Where `muck index` reports its summary counts** — the whole `result` dict is built in `pipeline.run_index` (lines 275-287) and emitted verbatim by `_emit(res)` at `cli.py:122`:
+```python
+    result = {
+        "documents": n_docs,
+        "chunks": n_chunks,
+        "embeddings": "on" if embeddings_active else "off (keyword-only)",
+    }
+    if settings.entities.resolve:
+        from .extract.entities import build_entities
+
+        result["entity_index"] = build_entities(conn, settings)
+    drift = field_map_drift(conn, settings)
+    if drift:
+        result["config_drift"] = drift
+    return result
+```
+So in the `muck index` JSON, the entity counts appear nested as `result["entity_index"] = {"entities": N, "mentions": N, "edges": N}`. The exact top-level keys `"entities": N, "mentions": N` (the phrasing the report quotes) come from **`status()`** in the same file (`pipeline.py:312-313`):
+```python
+        "entities": count("SELECT COUNT(*) FROM entities"),
+        "mentions": count("SELECT COUNT(*) FROM mentions"),
+```
+
+**Best insertion point for a notice/warning on `muck index`:** `pipeline.py` lines 284-287 — right where `config_drift` is conditionally added to `result`. That is the established pattern (a conditional top-level advisory string). A `result["notice"] = "…"` there flows straight out through `_emit(res)`. (Alternatively, add it inside the `entity_index` dict returned by `build_entities` at `entities.py:136`.)
+
+---
+
+## 2. spacy extra
+
+**File: `pyproject.toml`**, full `[project.optional-dependencies]` (lines 17-31):
+```toml
+[project.optional-dependencies]
+# Structured analytics + clustering (Phase 2).
+analytics = ["duckdb>=1.0", "scikit-learn>=1.4"]
+# Upgrade adapters (Phase 3).
+docx = ["python-docx>=1.1"]
+sbert = ["sentence-transformers>=3.0"]
+spacy = ["spacy>=3.7"]
+docling = ["docling>=2.0"]
+pymupdf = ["pymupdf>=1.24"]
+api = ["httpx>=0.27"]
+splink = ["splink>=4.0"]
+turbovec = ["turbovec>=0.8"]  # in-memory ANN accelerator for large corpora (needs arm64/linux wheel)
+all = [
+    "muck[analytics,docx,sbert,spacy,docling,pymupdf,api,splink,turbovec]",
+]
+```
+`spacy` is declared at **line 23** and re-referenced only inside the `all` aggregate at **line 30**.
+
+**Confirmed: there is no `spacy` import anywhere in `src/`.** `grep -rni "spacy" src/` returned nothing (exit 1). Across the whole repo (excluding `.venv`/lockfile), the *only* two `spacy` occurrences are `pyproject.toml:23` and `pyproject.toml:30`. The extra is declared but wired to nothing — no NER adapter, no import, no code path consumes it.
+
+---
+
+## 3. Corpus type detection (JSON records vs parsed PDFs)
+
+The discriminator is the **`documents.doc_type`** column (and, secondarily, whether `structured_json` is populated).
+
+**Schema — `src/muck/db.py` line 34** (`documents` table):
+```sql
+    doc_type        TEXT NOT NULL,
+```
+Comment on the `Record` dataclass enumerates the value set — `src/muck/schema.py:42`: `doc_type: str  # json|pdf|docx|md|txt`. (XML mapper also emits `doc_type="xml"`, `json_mapper.py:191` emits `"json"`.)
+
+**Where doc_type is written:**
+- JSON/XML records via mapper → `Record.doc_type` carried into `_insert_document` (`pipeline.py:145-155`, value at line 149 `record.doc_type`). These docs also get `structured_json` populated (line 151).
+- PDF/DOCX/TXT/MD via parser → `pipeline.py:178-181` constructs `Record(source_path=path, doc_type=ftype, ...)` (line 179), with **no `structured`** → `structured_json` is `NULL` for these.
+
+**Type sets defined in `pipeline.py` lines 22-25:**
+```python
+MAPPER_EXTS = {".json": "json", ".jsonl": "jsonl", ".xml": "xml"}
+PARSER_EXTS = {".pdf": "pdf", ".docx": "docx", ".txt": "txt", ".md": "md", ".markdown": "md", ".text": "txt"}
+MAPPER_TYPES = {"json", "jsonl", "xml"}
+PARSER_TYPES = {"pdf", "docx", "md", "txt"}
+```
+
+There is also **`source_files.file_type`** (`db.py:22`, values `ingested|json|jsonl|xml|pdf|docx|txt|md`), the ingest-level record.
+
+**How to detect a "pure-PDF corpus" at the end of indexing:** query `documents.doc_type` grouped/counted (e.g. `SELECT doc_type, COUNT(*) FROM documents GROUP BY doc_type`) at the tail of `run_index`. A pure-PDF (more generally pure-parser) corpus = every doc's `doc_type` ∈ `PARSER_TYPES` and none in `MAPPER_TYPES`. Equivalent signal already computed implicitly in `entities._gazetteer`: `gaz` empty (no `structured_json` anywhere) ⇒ `gaz_re is None` ⇒ only bill regex ran. `status()` already does the analogous grouping for document *status* at `pipeline.py:303-306` (a model for a `doc_type` breakdown), but currently records **no per-doc_type counts** and **no parse-mode column beyond `doc_type`**.
+
+---
+
+## 4. SKILL.md
+
+**File: `/Users/vibes/Documents/Development/Projects/muck/skill/SKILL.md`** (109 lines). Installed copy `/Users/vibes/.claude/skills/muck/SKILL.md` is **byte-identical** — plan to edit the repo copy and re-sync.
+
+**Heading structure:**
+- Frontmatter (lines 1-12): `name`, `description`, `allowed-tools: Bash, Read, Grep, Glob`
+- `# muck — investigate many documents without reading every token` (line 14)
+- `## When to use` (line 25)
+- `## Setup (once per corpus)` (line 31)
+- `## Investigation loop` (line 51)
+- `## Citation discipline — REQUIRED` (line 84)
+- `## Extending muck` (line 101)
+- `## Reusable investigation patterns` (line 105)
+
+**Current guidance on `search`/`grep` — `## Investigation loop`, lines 60-61:**
+```
+- **Find:** `muck search "<question>"` (auto = hybrid keyword+semantic; degrades to keyword
+  if embeddings are off). Use `muck grep "<regex>"` for exact strings (bill numbers, IDs).
+```
+
+**On snippets / not reading raw docs** — lines 16-19:
+```
+searches **locally**. The CLI does the heavy lifting; you read only retrieved snippets and
+**cite every claim to a verifiable source**. State persists in `<corpus>/.muck/index.db`,
+```
+and the "Do not read the documents directly" injunction, lines 28-30:
+```
+verifying, or quantifying facts across them (who-paid-whom, undisclosed ties, timing
+anomalies, spending patterns, revolving-door moves). **Do not read the documents
+directly** — let muck retrieve and aggregate.
+```
+
+**On entities/cross-reference** — lines 67-72 (relevant because PDF-only corpora produce a degenerate entity index):
+```
+- **Entities:** `muck entities --type org --name "Acme"` to find a resolved entity, then
+  `muck entities --entity <id>` to see every mention (each with a citation token) and the
+  entities it co-occurs with — your cross-reference / network view.
+- **Entity + similarity:** `muck search "<query>" --person "X"` (or `--org`, `--entity <id>`)
+  restricts to chunks mentioning that resolved entity and ranks them by cosine to the query;
+  add `--min-score` to threshold. This is the "person = X AND semantically about Y" query.
+```
+
+**On citations** — `## Citation discipline — REQUIRED`, lines 84-99 (verbatim key portion, lines 84-93):
+```
+## Citation discipline — REQUIRED
+Every search hit and entity mention carries a **citation token** (`docid@start-end#hash`).
+Before you assert any finding:
+1. Quote the supporting text **verbatim** from the snippet.
+2. Run `muck verify --token <token> --quote "<verbatim quote>"`. State the finding only if
+   `verified: true`. If `quote_supported` is false, you misread it — fix the quote or drop
+   the claim. Never assert a claim you cannot verify; say "unsupported" instead.
+3. Record it: `muck finding add --claim "…" --quote "…" --token <token>`.
+4. Before presenting results, run `muck audit` — it re-verifies every finding against
+   source and reports green/red. Drop or fix anything red.
+```
+
+**Enumeration / completeness:** there is **no** guidance anywhere in SKILL.md about result-set completeness, the `-k` truncation cap on `search`/`grep`, `total_matches`, or how to know when a grep/search returned a partial set. This is a genuine gap — a natural place to add such text is the `## Investigation loop` "Find" bullet (lines 60-61) and/or a new sentence in `## Citation discipline` about not asserting exhaustiveness ("no such X exists") without checking counts.
+
+---
+
+## 5. CLI structure
+
+**File: `src/muck/cli.py`.** Framework: **Typer** (`import typer`, line 19; `app = typer.Typer(...)`, line 42). New flags are added as `typer.Option(default, "--flag-name", help="…")` parameters on a `@app.command()`-decorated function; positional args use `typer.Argument(...)`. Typer auto-derives `--doc-type` from a param named `doc_type` when no explicit name is given. Every command emits via the shared `_emit()` (lines 58-59).
+
+**All subcommands + flags (one line each):**
+- `init` (line 74) — `directory` arg (default `"."`).
+- `ingest` (line 88) — `paths` (variadic arg).
+- `map` (line 98) — `--only-new/--all`.
+- `parse` (line 107) — `--only-new/--all`.
+- `index` (line 116) — `--only-new/--all`.
+- `status` (line 125) — no flags.
+- `search` (line 143) — `query` arg, `-k/--k`, `--mode`, `--doc-type`, `--doc-id`, `--path-like`, `--person`, `--org`, `--entity`, `--min-score`.
+- `grep` (line 180) — `pattern` arg, `-k/--k`, `--doc-type`, `--doc-id`.
+- `doc` (line 195) — `doc_id` arg.
+- `peek` (line 219) — `path` arg, `--sample`, `--samples`.
+- `sample` (line 229) — `query` arg, `--n`, `--tokens`, `--doc-type`, `--entity`, `--order`, `--raw/--no-raw`.
+- `read` (line 247) — `doc_ids` variadic arg, `--tokens`, `--raw/--no-raw`.
+- `cite` (line 265) — `token` arg.
+- `verify` (line 274) — `--token`, `--quote`.
+- `entities` (line 286) — `--entity`, `--type`, `--name`, `--min-count`, `-k/--k`.
+- `finding add` (line 309) — `--claim`, `--quote`, `--token`; `finding list` (line 322) — no flags.
+- `aggregate` (line 329) — `--by`, `--measure`, `--agg`, `--resolve`, `--sql`, `--engine`, `-k/--k`.
+- `cluster` (line 360) — `--k`.
+- `note add` (line 376) — `--text`, `--kind`, `--status`, `--entity` (repeatable), `--doc` (repeatable), `--token` (repeatable); `note list` (line 392) — `--status`, `--kind`, `--entity`, `-k/--k`; `note update` (line 404) — `obs_id` arg, `--status`, `--text`.
+- `recall` (line 417) — `query` arg, `--kind`, `--status`, `--entity`, `--mode`, `-k/--k`.
+- `audit` (line 433) — no flags.
+- `reconcile` (line 443) — `--on`, `--compare`, `--type`, `--threshold`, `--link`, `--train`, `--show`, `--run`.
+- `trace` (line 476) — `--tail`.
+
+**`grep` command in detail (lines 180-192):**
+```python
+@app.command()
+def grep(
+    pattern: str,
+    k: int = typer.Option(20, "-k", "--k"),
+    doc_type: str = typer.Option(None),
+    doc_id: str = typer.Option(None),
+):
+    """Regex search for exact strings (bill numbers, names, IDs)."""
+    muck_dir, settings, conn = _resolve()
+    hits = query_mod.grep(conn, settings, pattern, k, _filters(doc_type, doc_id, None))
+    out = [h.to_dict() for h in hits]
+    tracelog.log(conn, muck_dir, "grep", {"pattern": pattern, "k": k}, n_results=len(out))
+    _emit(out)
+```
+Output JSON shape: a **bare JSON array** of `Hit.to_dict()` objects (no envelope). The underlying store `grep` (`src/muck/stores/sqlite_store.py:87-99`) runs `WHERE regexp(?, c.text) … LIMIT ?` — it stops at `k` rows and does **not** compute a total match count, so a `total_matches` field would require a separate `COUNT(*)` query (there is currently no total available):
+```python
+    def grep(self, conn, pattern, k, filters=None):
+        where, params = _filter_sql(filters)
+        sql = (
+            "SELECT c.chunk_id AS chunk_id, c.text AS text FROM chunks c "
+            "JOIN documents d ON d.doc_id = c.doc_id "
+            "WHERE regexp(?, c.text)" + where + " LIMIT ?"
+        )
+        rows = conn.execute(sql, [pattern, *params, k]).fetchall()
+```
+
+**`index` command in detail** — shown in §1 (`cli.py:116-122`); output is the `run_index` **object** emitted by `_emit(res)`.
+
+The example pattern for **adding a new flag** (e.g. to grep): add a parameter like `count: bool = typer.Option(False, "--count", help="…")` between existing options, mirroring `doc_type: str = typer.Option(None)`.
+
+---
+
+## 6. Output / JSON conventions
+
+**Shared emitter — `src/muck/cli.py` lines 58-59:**
+```python
+def _emit(obj) -> None:
+    typer.echo(_json.dumps(obj, indent=2, default=str))
+```
+
+There is **no** universal `{"results": …, "notice": …}` envelope. Two shapes coexist:
+
+1. **Bare arrays** of `Hit.to_dict()` — `search`, `grep`, `entities` (list mode), `recall`, `trace`. `Hit.to_dict()` shape is fixed in `src/muck/schema.py:103-114` (`chunk_id, doc_id, doc_title, source_path, locator, score, match_mode, snippet, citation`). These have **no place to hang a top-level `total_matches`/`notice`** without wrapping the list in an object (a shape change).
+
+2. **Objects (dicts)** — `index`, `status`, `ingest`, `map`, `parse`, `aggregate` (list, actually), `sample`, `read`, `cite`, `verify`, `doc`, `finding`, `note`, `cluster`, `reconcile`, `audit`.
+
+**The house pattern for an advisory/"notice"-style field** is a **conditionally-added top-level string key on an object result**, exemplified by `config_drift`:
+- `pipeline.run_index` (lines 284-286):
+```python
+    drift = field_map_drift(conn, settings)
+    if drift:
+        result["config_drift"] = drift
+```
+- `pipeline.status` (lines 323-325): identical pattern appends `result["config_drift"]`.
+
+A new `notice` field on the `index` result should mirror this exactly (add to the object at `pipeline.py:284-287`). For **count** fields, the established precedent is the `returned` key returned by the reader (`src/muck/reader.py`, referenced at `cli.py:241-243` and `cli.py:259-261` via `out["returned"]`) and `n_records`/`n_merged_clusters` in `reconcile` — i.e. object results carry explicit count fields. So `total_matches` fits naturally only if grep/search are migrated from bare-array to object envelopes; otherwise there is no house precedent for a scalar alongside a bare array.
+
+---
+
+## 7. Docs that document grep/search flags (update alongside code)
+
+- **`README.md`** — line 29 shows `muck search "who lobbied on H.R. 1234"` in the quickstart (lines 14-33). No per-flag documentation of grep/search; light touch.
+- **`skill/SKILL.md`** — lines 60-61 (`Find:` search + grep), lines 70-72 (entity+similarity `search --person/--org`). Frontmatter `allowed-tools` line 11.
+- **`skill/references/QUERIES.md`** — grep at **lines 42, 50** (`muck grep "(formerly|previously|…)"`); search at **lines 60-62** and **line 86**. This is the most flag-detailed doc for search/grep usage.
+- **`skill/references/SCHEMA.md`** — line 31 references `muck search` (contrasted with `muck recall`).
+- **`skill/references/ADAPTERS.md`** — line 83 mentions keeping "FTS5/BM25/grep" when subclassing `SqliteStore` (relevant only if grep's store method signature changes).
+- **Installed copies under `~/.claude/skills/muck/`** — `SKILL.md` (identical to repo) plus a `references/` dir; any doc edits in `skill/` must be re-copied there to take effect for the deployed skill.
+
+---
+
+### Cross-cutting notes for the implementation plan
+- A pure-PDF corpus is detectable at the end of `run_index` via `documents.doc_type` (all ∈ `PARSER_TYPES`) or, equivalently, an empty gazetteer (`_gazetteer` returns `None` pattern). The natural notice-injection site is `pipeline.py:284-287`, mirroring `config_drift`.
+- The `spacy` extra (`pyproject.toml:23`) is entirely unwired — no importer exists, confirming the report. If the fix is "warn that NER isn't available," note that even installing `--extra spacy` changes nothing today.
+- `grep`/`search` emit bare JSON arrays (`cli.py:177`, `cli.py:192`), so adding `total_matches`/`notice` to them is a **shape change** (array → object), unlike `index`/`status` where a top-level advisory key already fits the existing pattern.
+
+**Tool Call: Design muck field-report fixes**
+Status: Failed
+
+```
+[Request interrupted by user for tool use]
+```
+
+**Tool Call: Read src/muck/search/query.py**
+Status: Completed
+
+```
+1	"""Progressive search: keyword (BM25) / semantic (vectors) / hybrid (RRF).
+2	
+3	Mirrors the graceful multi-level fallback of ``deep-reader``'s search: ``auto`` degrades
+4	to keyword when embeddings aren't available, so retrieval never fails for lack of a model
+5	or API key. Every result is returned as a ``Hit`` carrying a verifiable ``Citation``.
+6	"""
+7	
+8	from __future__ import annotations
+9	
+10	import sqlite3
+11	
+12	from ..cite import make_citation
+13	from ..config import Settings
+14	from ..db import meta_get
+15	from ..embedders import build_embedder
+16	from ..interfaces.store import get_store
+17	from ..schema import Hit
+18	
+19	
+20	def _vectors_ready(conn, settings: Settings, store) -> bool:
+21	    return (
+22	        settings.embedder.enabled
+23	        and store.supports_vectors(conn)
+24	        and meta_get(conn, "embed_dim") is not None
+25	    )
+26	
+27	
+28	def _rrf(rank_lists: list[list[str]], k0: int = 60) -> list[str]:
+29	    scores: dict[str, float] = {}
+30	    for lst in rank_lists:
+31	        for rank, cid in enumerate(lst):
+32	            scores[cid] = scores.get(cid, 0.0) + 1.0 / (k0 + rank)
+33	    return sorted(scores, key=lambda c: scores[c], reverse=True)
+34	
+35	
+36	def _build_hits(conn, ordered_ids, snippets, mode) -> list[Hit]:
+37	    if not ordered_ids:
+38	        return []
+39	    placeholders = ",".join("?" * len(ordered_ids))
+40	    rows = conn.execute(
+41	        f"SELECT c.chunk_id, c.doc_id, c.text, c.char_start, c.char_end, c.locator, "
+42	        f"d.source_path, d.title FROM chunks c JOIN documents d ON d.doc_id=c.doc_id "
+43	        f"WHERE c.chunk_id IN ({placeholders})",
+44	        ordered_ids,
+45	    ).fetchall()
+46	    by_id = {r["chunk_id"]: r for r in rows}
+47	    hits = []
+48	    for rank, cid in enumerate(ordered_ids):
+49	        r = by_id.get(cid)
+50	        if r is None:
+51	            continue
+52	        citation = make_citation(
+53	            r["doc_id"], r["source_path"], r["locator"],
+54	            r["char_start"], r["char_end"], r["text"],
+55	        )
+56	        snippet = snippets.get(cid) or (r["text"][:220].strip() + ("…" if len(r["text"]) > 220 else ""))
+57	        hits.append(
+58	            Hit(
+59	                chunk_id=cid,
+60	                doc_id=r["doc_id"],
+61	                doc_title=r["title"],
+62	                source_path=r["source_path"],
+63	                locator=r["locator"],
+64	                score=1.0 / (1 + rank),
+65	                match_mode=mode,
+66	                snippet=snippet,
+67	                citation=citation,
+68	            )
+69	        )
+70	    return hits
+71	
+72	
+73	def search(conn, settings: Settings, query: str, mode: str = "auto", k: int = 8, filters=None) -> list[Hit]:
+74	    store = get_store(settings.store.backend)
+75	    has_vec = _vectors_ready(conn, settings, store)
+76	    if mode == "auto":
+77	        mode = "hybrid" if has_vec else "keyword"
+78	
+79	    rerank_on = settings.reranker.enabled
+80	    pool = max(k * 5, 20) if rerank_on else k  # rerank a wider candidate set, then trim
+81	
+82	    bm_ids: list[str] = []
+83	    vec_ids: list[str] = []
+84	    snippets: dict[str, str] = {}
+85	
+86	    if mode in ("keyword", "hybrid"):
+87	        bm_res = store.search_bm25(conn, query, pool, filters)
+88	        bm_ids = [cid for cid, _, _ in bm_res]
+89	        snippets = {cid: snip for cid, _, snip in bm_res}
+90	
+91	    if mode in ("semantic", "hybrid") and has_vec:
+92	        emb = build_embedder(settings)
+93	        qvec = emb.embed([query])[0]
+94	        vec_ids = [cid for cid, _ in store.search_vector(conn, qvec, pool, filters)]
+95	
+96	    if mode == "keyword":
+97	        ordered = bm_ids
+98	    elif mode == "semantic":
+99	        ordered = vec_ids
+100	    else:
+101	        ordered = _rrf([bm_ids, vec_ids])
+102	
+103	    hits = _build_hits(conn, ordered[:pool], snippets, mode)
+104	
+105	    if rerank_on and hits:
+106	        from ..interfaces.reranker import get_reranker
+107	
+108	        reranker = get_reranker(settings.reranker.name)
+109	        scores = reranker.rerank(query, [h.citation.quote for h in hits])
+110	        for h, s in zip(hits, scores):
+111	            h.score = float(s)
+112	            h.match_mode = f"{mode}+rerank"
+113	        hits.sort(key=lambda h: h.score, reverse=True)
+114	
+115	    return hits[:k]
+116	
+117	
+118	def _resolve_entity_ids(conn, entity_id=None, name=None, etype=None) -> list[str]:
+119	    if entity_id:
+120	        return [entity_id]
+121	    q, params = "SELECT entity_id FROM entities WHERE 1=1", []
+122	    if etype:
+123	        q += " AND entity_type = ?"
+124	        params.append(etype)
+125	    if name:
+126	        q += (" AND (canonical_name LIKE ? OR norm_key LIKE ? OR entity_id IN "
+127	              "(SELECT entity_id FROM entity_aliases WHERE alias LIKE ?))")
+128	        params += [f"%{name}%", f"%{name.lower()}%", f"%{name}%"]
+129	    return [r[0] for r in conn.execute(q, params).fetchall()]
+130	
+131	
+132	def _entity_chunk_ids(conn, entity_ids: list[str]) -> list[str]:
+133	    if not entity_ids:
+134	        return []
+135	    ph = ",".join("?" * len(entity_ids))
+136	    return [r[0] for r in conn.execute(
+137	        f"SELECT DISTINCT chunk_id FROM mentions WHERE entity_id IN ({ph})", entity_ids
+138	    ).fetchall()]
+139	
+140	
+141	def search_in_entity(conn, settings: Settings, query: str, *, entity_id=None, name=None,
+142	                     etype=None, k: int = 8, min_score: float | None = None) -> list[Hit]:
+143	    """Chunks that mention an entity (e.g. person = X), ranked by cosine to ``query``.
+144	
+145	    Resolves the entity (merged aliases included) -> its chunk_ids, then ranks that
+146	    candidate set by true cosine similarity to the query embedding. Falls back to keyword
+147	    ranking within the same set if embeddings are disabled. ``min_score`` filters by cosine.
+148	    """
+149	    import numpy as np
+150	
+151	    candidates = _entity_chunk_ids(conn, _resolve_entity_ids(conn, entity_id, name, etype))
+152	    label = f"{etype or 'entity'}+cosine"
+153	    if not candidates:
+154	        return []
+155	    if not query:
+156	        return _build_hits(conn, candidates[:k], {}, f"{etype or 'entity'}-only")
+157	
+158	    emb = build_embedder(settings)
+159	    if emb is not None:
+160	        store = get_store(settings.store.backend)
+161	        ids, mat = store.get_vectors(conn, candidates)  # reuse vectors stored at index time
+162	        if not ids:
+163	            # Keyword-only index (no stored vectors): recompute as a fallback.
+164	            ph = ",".join("?" * len(candidates))
+165	            rows = conn.execute(
+166	                f"SELECT chunk_id, text FROM chunks WHERE chunk_id IN ({ph})", candidates
+167	            ).fetchall()
+168	            ids = [r["chunk_id"] for r in rows]
+169	            mat = np.asarray(emb.embed([r["text"] for r in rows]), dtype="float32")
+170	        qvec = np.asarray(emb.embed([query])[0], dtype="float32")
+171	        cos = (mat @ qvec).tolist()  # vectors are L2-normalized → dot product = cosine
+172	        scored = sorted(zip(ids, cos), key=lambda t: t[1], reverse=True)
+173	        if min_score is not None:
+174	            scored = [(i, s) for i, s in scored if s >= min_score]
+175	        scored = scored[:k]
+176	        hits = _build_hits(conn, [i for i, _ in scored], {}, label)
+177	        score_map = dict(scored)
+178	        for h in hits:
+179	            h.score = round(float(score_map[h.chunk_id]), 4)
+180	        return hits
+181	
+182	    # No embeddings: rank the entity's chunks by BM25 within the candidate set.
+183	    store = get_store(settings.store.backend)
+184	    res = store.search_bm25(conn, query, k, {"chunk_ids": candidates})
+185	    return _build_hits(conn, [c for c, _, _ in res], {c: s for c, _, s in res}, f"{etype or 'entity'}+keyword")
+186	
+187	
+188	def grep(conn, settings: Settings, pattern: str, k: int = 20, filters=None) -> list[Hit]:
+189	    store = get_store(settings.store.backend)
+190	    res = store.grep(conn, pattern, k, filters)
+191	    ids = [cid for cid, _ in res]
+192	    snippets = {cid: snip for cid, snip in res}
+193	    return _build_hits(conn, ids, snippets, "grep")
+194	
+```
+
+**Tool Call: Read src/muck/stores/sqlite_store.py (1 - 120)**
+Status: Completed
+
+```
+1	"""Default store: FTS5 keyword/BM25 + grep + sqlite-vec ANN, all in one DB file."""
+2	
+3	from __future__ import annotations
+4	
+5	import re
+6	import sqlite3
+7	
+8	from ..db import meta_get, meta_set, vec_available
+9	from ..interfaces.store import register_store
+10	from ..schema import Chunk
+11	
+12	_TOKEN = re.compile(r"[\w'-]+")
+13	
+14	
+15	def _fts_safe(query: str) -> str:
+16	    """Quote each term so arbitrary user text is a valid FTS5 MATCH (AND semantics)."""
+17	    terms = _TOKEN.findall(query)
+18	    return " ".join(f'"{t}"' for t in terms)
+19	
+20	
+21	def _filter_sql(filters: dict | None) -> tuple[str, list]:
+22	    if not filters:
+23	        return "", []
+24	    clauses, params = [], []
+25	    if filters.get("doc_type"):
+26	        clauses.append("d.doc_type = ?")
+27	        params.append(filters["doc_type"])
+28	    if filters.get("doc_id"):
+29	        clauses.append("d.doc_id = ?")
+30	        params.append(filters["doc_id"])
+31	    if filters.get("path_like"):
+32	        clauses.append("d.source_path LIKE ?")
+33	        params.append(filters["path_like"])
+34	    if filters.get("chunk_ids"):
+35	        ids = list(filters["chunk_ids"])
+36	        clauses.append(f"c.chunk_id IN ({','.join('?' * len(ids))})")
+37	        params.extend(ids)
+38	    return (" AND " + " AND ".join(clauses) if clauses else ""), params
+39	
+40	
+41	def _snippet(text: str, around: str | None = None, width: int = 220) -> str:
+42	    if around:
+43	        m = re.search(re.escape(around), text, re.IGNORECASE)
+44	        if m:
+45	            lo = max(0, m.start() - width // 2)
+46	            hi = min(len(text), m.end() + width // 2)
+47	            return ("…" if lo else "") + text[lo:hi].strip() + ("…" if hi < len(text) else "")
+48	    return text[:width].strip() + ("…" if len(text) > width else "")
+49	
+50	
+51	class SqliteStore:
+52	    name = "sqlite-fts5"
+53	
+54	    # --- keyword ---------------------------------------------------------
+55	    def index_chunks(self, conn: sqlite3.Connection, chunks: list[Chunk]) -> None:
+56	        conn.executemany(
+57	            "INSERT INTO chunks(chunk_id, doc_id, chunk_index, text, char_start, "
+58	            "char_end, locator, token_count) VALUES(?,?,?,?,?,?,?,?)",
+59	            [
+60	                (c.chunk_id, c.doc_id, c.chunk_index, c.text, c.char_start,
+61	                 c.char_end, c.locator, c.token_count)
+62	                for c in chunks
+63	            ],
+64	        )
+65	        conn.executemany(
+66	            "INSERT INTO chunks_fts(chunk_id, text) VALUES(?, ?)",
+67	            [(c.chunk_id, c.text) for c in chunks],
+68	        )
+69	
+70	    def search_bm25(self, conn, query, k, filters=None):
+71	        match = _fts_safe(query)
+72	        if not match:
+73	            return []
+74	        where, params = _filter_sql(filters)
+75	        sql = (
+76	            "SELECT f.chunk_id AS chunk_id, bm25(chunks_fts) AS score, "
+77	            "snippet(chunks_fts, 0, '[', ']', '…', 14) AS snip "
+78	            "FROM chunks_fts f "
+79	            "JOIN chunks c ON c.chunk_id = f.chunk_id "
+80	            "JOIN documents d ON d.doc_id = c.doc_id "
+81	            "WHERE chunks_fts MATCH ?" + where + " ORDER BY score LIMIT ?"
+82	        )
+83	        rows = conn.execute(sql, [match, *params, k]).fetchall()
+84	        # bm25() returns lower = better; flip so higher = better.
+85	        return [(r["chunk_id"], -float(r["score"]), r["snip"]) for r in rows]
+86	
+87	    def grep(self, conn, pattern, k, filters=None):
+88	        where, params = _filter_sql(filters)
+89	        sql = (
+90	            "SELECT c.chunk_id AS chunk_id, c.text AS text FROM chunks c "
+91	            "JOIN documents d ON d.doc_id = c.doc_id "
+92	            "WHERE regexp(?, c.text)" + where + " LIMIT ?"
+93	        )
+94	        rows = conn.execute(sql, [pattern, *params, k]).fetchall()
+95	        out = []
+96	        for r in rows:
+97	            m = re.search(pattern, r["text"], re.IGNORECASE)
+98	            out.append((r["chunk_id"], _snippet(r["text"], m.group(0) if m else None)))
+99	        return out
+100	
+101	    # --- vector ----------------------------------------------------------
+102	    def supports_vectors(self, conn) -> bool:
+103	        return vec_available(conn)
+104	
+105	    def _ensure_vec_table(self, conn, dim: int) -> None:
+106	        stored = meta_get(conn, "embed_dim")
+107	        if stored is None:
+108	            conn.execute(
+109	                f"CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec "
+110	                f"USING vec0(chunk_id TEXT PRIMARY KEY, embedding float[{dim}])"
+111	            )
+112	            meta_set(conn, "embed_dim", dim)
+113	        elif int(stored) != dim:
+114	            raise ValueError(
+115	                f"embedding dim {dim} != existing index dim {stored}; re-index after "
+116	                f"changing embedder (delete .muck/index.db or run `muck index --reset`)"
+117	            )
+118	
+119	    def upsert_vectors(self, conn, ids, vecs) -> None:
+120	        if not vec_available(conn):
+```
+
+## Assistant
+
+Now the pipeline/CLI/SKILL.md pieces:
+
+**Tool Call: Read src/muck/pipeline.py (240 - 334)**
+Status: Completed
+
+```
+240	        "SELECT doc_id, title, text, locator, pages_json FROM documents WHERE status='extracted'"
+241	    ).fetchall()
+242	
+243	    contextual = settings.embedder.contextual
+244	    n_docs = n_chunks = 0
+245	    pending_ids: list[str] = []
+246	    pending_texts: list[str] = []
+247	
+248	    def flush_vectors():
+249	        nonlocal pending_ids, pending_texts
+250	        if embeddings_active and pending_ids:
+251	            vecs = embedder.embed(pending_texts)
+252	            store.upsert_vectors(conn, pending_ids, vecs)
+253	        pending_ids, pending_texts = [], []
+254	
+255	    for d in docs:
+256	        pages = None
+257	        if d["pages_json"]:
+258	            pages = [Page(*p) for p in json.loads(d["pages_json"])]
+259	        chunks = chunk_document(d["doc_id"], d["text"], settings.chunk, pages, d["locator"])
+260	        if chunks:
+261	            store.index_chunks(conn, chunks)
+262	            prefix = f"{d['title']}. " if (contextual and d["title"]) else ""
+263	            for c in chunks:
+264	                pending_ids.append(c.chunk_id)
+265	                # Contextual retrieval: embed with doc context; stored chunk + offsets stay raw.
+266	                pending_texts.append(prefix + c.text if prefix else c.text)
+267	        conn.execute("UPDATE documents SET status='indexed', indexed_at=? WHERE doc_id=?", (_now(), d["doc_id"]))
+268	        n_docs += 1
+269	        n_chunks += len(chunks)
+270	        if len(pending_ids) >= batch:
+271	            flush_vectors()
+272	        conn.commit()
+273	    flush_vectors()
+274	    conn.commit()
+275	    result = {
+276	        "documents": n_docs,
+277	        "chunks": n_chunks,
+278	        "embeddings": "on" if embeddings_active else "off (keyword-only)",
+279	    }
+280	    if settings.entities.resolve:
+281	        from .extract.entities import build_entities
+282	
+283	        result["entity_index"] = build_entities(conn, settings)
+284	    drift = field_map_drift(conn, settings)
+285	    if drift:
+286	        result["config_drift"] = drift
+287	    return result
+288	
+289	
+290	# --- status ------------------------------------------------------------------
+291	# (observations summary is attached in status() below)
+292	
+293	def status(conn, settings: Settings) -> dict:
+294	    def count(sql, *p):
+295	        return conn.execute(sql, p).fetchone()[0]
+296	
+297	    from .db import meta_get, vec_available
+298	
+299	    files_by_status = {
+300	        r["status"]: r["n"]
+301	        for r in conn.execute("SELECT status, COUNT(*) n FROM source_files GROUP BY status")
+302	    }
+303	    docs_by_status = {
+304	        r["status"]: r["n"]
+305	        for r in conn.execute("SELECT status, COUNT(*) n FROM documents GROUP BY status")
+306	    }
+307	    result = {
+308	        "source_files": files_by_status,
+309	        "documents": docs_by_status,
+310	        "chunks": count("SELECT COUNT(*) FROM chunks"),
+311	        "fts_rows": count("SELECT COUNT(*) FROM chunks_fts"),
+312	        "entities": count("SELECT COUNT(*) FROM entities"),
+313	        "mentions": count("SELECT COUNT(*) FROM mentions"),
+314	        "findings": count("SELECT COUNT(*) FROM findings"),
+315	        "embeddings_enabled": settings.embedder.enabled,
+316	        "embedder": settings.embedder.name if settings.embedder.enabled else None,
+317	        "embed_dim": meta_get(conn, "embed_dim"),
+318	        "vector_backend_available": vec_available(conn),
+319	    }
+320	    from . import observations
+321	
+322	    result["observations"] = observations.open_summary(conn)
+323	    drift = field_map_drift(conn, settings)
+324	    if drift:
+325	        result["config_drift"] = drift
+326	    return result
+327	    return result
+328	
+```
+
+**Tool Call: Read src/muck/cli.py (140 - 199)**
+Status: Completed
+
+```
+140	    return f
+141	
+142	
+143	@app.command()
+144	def search(
+145	    query: str = typer.Argument("", help="Semantic/keyword query (may be empty with --person/--org)"),
+146	    k: int = typer.Option(8, "-k", "--k"),
+147	    mode: str = typer.Option("auto", help="auto|keyword|semantic|hybrid"),
+148	    doc_type: str = typer.Option(None),
+149	    doc_id: str = typer.Option(None),
+150	    path_like: str = typer.Option(None, help="SQL LIKE filter on source path"),
+151	    person: str = typer.Option(None, "--person", help="Only chunks mentioning this person, ranked by cosine"),
+152	    org: str = typer.Option(None, "--org", help="Only chunks mentioning this organization"),
+153	    entity: str = typer.Option(None, "--entity", help="Only chunks mentioning this entity_id"),
+154	    min_score: float = typer.Option(None, "--min-score", help="Min cosine similarity [0..1]"),
+155	):
+156	    """Search the corpus; each hit carries a verifiable citation token.
+157	
+158	    With --person/--org/--entity, restricts to chunks mentioning that resolved entity and
+159	    ranks them by cosine similarity to the query (the entity-filter + similarity query).
+160	    """
+161	    muck_dir, settings, conn = _resolve()
+162	    if person or org or entity:
+163	        kwargs = {"k": k, "min_score": min_score}
+164	        if entity:
+165	            kwargs["entity_id"] = entity
+166	        elif person:
+167	            kwargs.update(name=person, etype="person")
+168	        else:
+169	            kwargs.update(name=org, etype="org")
+170	        hits = query_mod.search_in_entity(conn, settings, query, **kwargs)
+171	        logargs = {"query": query, "person": person, "org": org, "entity": entity, "min_score": min_score}
+172	    else:
+173	        hits = query_mod.search(conn, settings, query, mode, k, _filters(doc_type, doc_id, path_like))
+174	        logargs = {"query": query, "mode": mode, "k": k}
+175	    out = [h.to_dict() for h in hits]
+176	    tracelog.log(conn, muck_dir, "search", logargs, n_results=len(out))
+177	    _emit(out)
+178	
+179	
+180	@app.command()
+181	def grep(
+182	    pattern: str,
+183	    k: int = typer.Option(20, "-k", "--k"),
+184	    doc_type: str = typer.Option(None),
+185	    doc_id: str = typer.Option(None),
+186	):
+187	    """Regex search for exact strings (bill numbers, names, IDs)."""
+188	    muck_dir, settings, conn = _resolve()
+189	    hits = query_mod.grep(conn, settings, pattern, k, _filters(doc_type, doc_id, None))
+190	    out = [h.to_dict() for h in hits]
+191	    tracelog.log(conn, muck_dir, "grep", {"pattern": pattern, "k": k}, n_results=len(out))
+192	    _emit(out)
+193	
+194	
+195	@app.command()
+196	def doc(doc_id: str):
+197	    """Show one document's manifest (source, locator, type, status) + its entities."""
+198	    muck_dir, settings, conn = _resolve()
+199	    row = conn.execute(
+```
+
+**Tool Call: Read src/muck/db.py (185 - 219)**
+Status: Completed
+
+```
+185	    support_json   TEXT,
+186	    status         TEXT NOT NULL DEFAULT 'unaudited',
+187	    created_at     TEXT,
+188	    audited_at     TEXT
+189	);
+190	"""
+191	
+192	
+193	@lru_cache(maxsize=256)
+194	def _compiled(pattern: str) -> re.Pattern:
+195	    return re.compile(pattern, re.IGNORECASE)
+196	
+197	
+198	def _regexp(pattern: str, value: str | None) -> int:
+199	    if value is None:
+200	        return 0
+201	    return 1 if _compiled(pattern).search(value) else 0
+202	
+203	
+204	def connect(db_path: str | Path) -> sqlite3.Connection:
+205	    conn = sqlite3.connect(str(db_path))
+206	    conn.row_factory = sqlite3.Row
+207	    conn.execute("PRAGMA journal_mode=WAL")
+208	    conn.create_function("regexp", 2, _regexp, deterministic=True)
+209	    try:
+210	        conn.enable_load_extension(True)
+211	        import sqlite_vec
+212	
+213	        sqlite_vec.load(conn)
+214	        conn.enable_load_extension(False)
+215	    except Exception:
+216	        pass  # vector path degrades gracefully; keyword search still works
+217	    return conn
+218	
+219	
+```
+
+**Tool Call: Read skill/SKILL.md**
+Status: Completed
+
+```
+1	---
+2	name: muck
+3	description: >-
+4	  Investigate a large corpus of documents (JSON records like lobbying filings or press
+5	  releases, plus PDF/DOCX/TXT) without reading every file. muck builds a persistent,
+6	  citation-verified index so you retrieve only the relevant page/field-level snippets,
+7	  resolve and cross-reference entities, run exact aggregations, and tie every claim to a
+8	  verifiable source. Use when pointed at a folder of many documents and asked to find,
+9	  cross-reference, verify, or quantify entities, relationships, money, or timing across
+10	  them — and whenever a finding must be auditable.
+11	allowed-tools: Bash, Read, Grep, Glob
+12	---
+13	
+14	# muck — investigate many documents without reading every token
+15	
+16	You drive the deterministic `muck` CLI, which parses, indexes, resolves entities, and
+17	searches **locally**. The CLI does the heavy lifting; you read only retrieved snippets and
+18	**cite every claim to a verifiable source**. State persists in `<corpus>/.muck/index.db`,
+19	so an investigation stays organized across sessions.
+20	
+21	Run commands as `muck …` (installed console script) or, if not on PATH,
+22	`python -m muck …`. Every command prints JSON (except `init`). Run `muck COMMAND --help`
+23	for options.
+24	
+25	## When to use
+26	A folder of many documents + a question that requires finding, cross-referencing,
+27	verifying, or quantifying facts across them (who-paid-whom, undisclosed ties, timing
+28	anomalies, spending patterns, revolving-door moves). **Do not read the documents
+29	directly** — let muck retrieve and aggregate.
+30	
+31	## Setup (once per corpus)
+32	1. Install: `uv sync --no-editable` (add `--extra analytics` for `aggregate`/`cluster`).
+33	   Then `python skill/scripts/install_check.py` reports which path is active (no API key
+34	   or GPU is required — Potion embeddings and SQLite run locally).
+35	2. `muck init <corpus_dir>`
+36	3. **Calibrate, then configure.** Don't guess the schema — look at it: `muck peek <a file>`
+37	   reports the record array, field names/types, sample records, and a *suggested* `[mapper.fields]`
+38	   map. Adapt that into `<corpus_dir>/.muck/config.toml` (which field is the registrant, the
+39	   amount, the date, which name people/orgs). See `references/ADAPTERS.md`. This makes citations
+40	   field-precise and entity resolution accurate. After indexing, `muck sample` (optionally
+41	   `--query "<topic>"`) loads a token-budgeted batch of full records so you can get a feel for the
+42	   data and form hypotheses before running targeted queries.
+43	4. `muck ingest <corpus_dir>` → `muck map` (JSON) and/or `muck parse` (PDF/DOCX/text) →
+44	   `muck index` → (optional) `muck cluster`. These are idempotent — re-run anytime to pick
+45	   up new files; interrupted runs resume.
+46	
+47	If you edit `[mapper.fields]` after the first run, re-run `muck map --all` then
+48	`muck index --all` to apply it (field values are produced at *map* time). `muck status`/`index`
+49	surface a `config_drift` message when the field map changed but hasn't been re-mapped.
+50	
+51	## Investigation loop
+52	- **Resume / orient:** `muck status` shows what's indexed *and your open threads* (open
+53	  leads/hypotheses/questions). On a new session, start here, then `muck recall "<topic>"` or
+54	  `muck note list --status open` to pick up where you left off — don't re-derive state.
+55	- **Record as you work (memory):** `muck note add --text "…" --kind lead|decision|hypothesis|
+56	  question [--entity <id>] [--token <cite>]` — capture leads, the *why* behind a choice
+57	  (`decision`), and threads. Mark threads `--status cold` when they dead-end, `confirmed` when
+58	  they pan out (a confirmed lead becomes a `finding`). `muck recall "<query>"` searches *your
+59	  memory* (notes + findings); `muck search` searches *the corpus* — keep them distinct.
+60	- **Find:** `muck search "<question>"` (auto = hybrid keyword+semantic; degrades to keyword
+61	  if embeddings are off). Use `muck grep "<regex>"` for exact strings (bill numbers, IDs).
+62	- **Read in full:** once you've narrowed to relevant `doc_id`s, `muck read <id> <id> …` returns
+63	  the **whole records side by side** (token-budgeted), each with a whole-document citation token.
+64	  Use this — not repeated chunk reads — when you need full context to compare records, spot
+65	  patterns, or read a finding's source. (Searching/aggregating still does the heavy lifting at
+66	  scale; `read` is for the handful you've zeroed in on.)
+67	- **Entities:** `muck entities --type org --name "Acme"` to find a resolved entity, then
+68	  `muck entities --entity <id>` to see every mention (each with a citation token) and the
+69	  entities it co-occurs with — your cross-reference / network view.
+70	- **Entity + similarity:** `muck search "<query>" --person "X"` (or `--org`, `--entity <id>`)
+71	  restricts to chunks mentioning that resolved entity and ranks them by cosine to the query;
+72	  add `--min-score` to threshold. This is the "person = X AND semantically about Y" query.
+73	- **Quantify:** `muck aggregate --by registrant --measure amount --agg sum --resolve org`
+74	  (exact SQL totals, folded onto resolved entities), or `muck aggregate --sql "SELECT …"`.
+75	  Runs on **DuckDB** over the read-only SQLite store when available (else SQLite json1).
+76	  With `--sql` on DuckDB, the corpus is `muck.*` and you can join **external files**:
+77	  `--sql "SELECT … FROM read_json_auto('fec.json') f JOIN muck.documents d ON …"`.
+78	- **Reconcile / link (opt-in):** for messy multi-field records or linking to an outside
+79	  dataset, `muck reconcile --on registrant --compare address,zip [--link other.json]`
+80	  (Splink, `--extra splink`). Name-dominant + fully audited (scores, clusters, threshold);
+81	  cite the match probability for any linkage claim. See `references/QUERIES.md` §6.
+82	- **Topics:** `muck cluster` then read cluster labels to navigate themes.
+83	
+84	## Citation discipline — REQUIRED
+85	Every search hit and entity mention carries a **citation token** (`docid@start-end#hash`).
+86	Before you assert any finding:
+87	1. Quote the supporting text **verbatim** from the snippet.
+88	2. Run `muck verify --token <token> --quote "<verbatim quote>"`. State the finding only if
+89	   `verified: true`. If `quote_supported` is false, you misread it — fix the quote or drop
+90	   the claim. Never assert a claim you cannot verify; say "unsupported" instead.
+91	3. Record it: `muck finding add --claim "…" --quote "…" --token <token>`.
+92	4. Before presenting results, run `muck audit` — it re-verifies every finding against
+93	   source and reports green/red. Drop or fix anything red.
+94	
+95	For aggregate claims (totals, counts), cite the exact `muck aggregate` command and its row
+96	count rather than a snippet — the query is the reproducible evidence.
+97	
+98	The audit trail (`muck trace`) records every tool call; keep it as part of the submission's
+99	interaction traces.
+100	
+101	## Extending muck
+102	Swap the parser, embedder, vector store, or reranker, or enable API models — one config
+103	edit + (sometimes) one adapter file. See `references/ADAPTERS.md`.
+104	
+105	## Reusable investigation patterns
+106	`references/QUERIES.md`: entity-resolution sweep, money-flow cross-reference, timing-anomaly
+107	scan, and a revolving-door (firm↔government) detector. `references/CITATIONS.md` explains how
+108	the verification guarantee works; `references/SCHEMA.md` documents the database for auditors.
+109	
+```
+
+**Tool Call: grep -rn "\.grep(\|query_mod\.grep\|q\.grep\|store\.grep" /Users/vibes/Documents/Development/Projects/muck/src /Users/vibes/Documents/Development/Projects/muck/tests /Users/vibes/Documents/Development/Projects/muck/skill 2>/dev/null; echo "---"; grep -rn "def grep\|grep(" /Users/vibes/Documents/Development/Projects/muck/src/muck/stores/turbovec_store.py 2>/dev/null | head; echo "---"; grep -rn "grep" /Users/vibes/Documents/Development/Projects/muck/skill/references/QUERIES.md**
+Status: Completed
+
+Terminal:
+```
+/Users/vibes/Documents/Development/Projects/muck/src/muck/cli.py:189:    hits = query_mod.grep(conn, settings, pattern, k, _filters(doc_type, doc_id, None))
+/Users/vibes/Documents/Development/Projects/muck/src/muck/search/query.py:190:    res = store.grep(conn, pattern, k, filters)
+/Users/vibes/Documents/Development/Projects/muck/tests/test_pipeline_e2e.py:79:    hits = q.grep(conn, settings, r"H\.R\. 1234", 10)
+---
+---
+/Users/vibes/Documents/Development/Projects/muck/skill/references/QUERIES.md:50:muck grep "(formerly|previously|chief of staff|served as|now at|joined)"   # role-change language
+```
+
+
+**Tool Call: Write /Users/vibes/.claude/plans/field\-report\-retrieval\-display\-parallel\-hellman.md**
+Status: Completed
+
+Diff: /Users/vibes/.claude/plans/field-report-retrieval-display-parallel-hellman.md
+```
+# muck field-report fixes: retrieval display & completeness
+
+## Context
+
+A field report from a real investigation (596 archived ANNA PDFs, index at
+`/Users/vibes/Documents/Development/Projects/anna/.muck/index.db`) documented a factual
+error caused by three tool failures plus one silent degradation:
+
+1. **P0** — Hybrid/semantic search hits that weren't in the BM25 pool display the chunk
+   *head* as snippet instead of a query-relevant window, so agents dismiss correct hits.
+2. **P0** — `muck grep` silently truncates at `-k` in insertion order with no total count,
+   so agents treat a top-k slice as the full universe for enumeration questions.
+3. **P1** — Literal-phrase grep fails across PDF line breaks (`"Libyan \r\nStock Market"`),
+   while `muck verify` normalizes whitespace — the discovery tool is stricter than the
+   verification tool.
+4. **P2** — Entity resolution is silently inert on pure-PDF corpora (gazetteer needs JSON
+   `entity_fields`); `pyproject.toml` also declares a `spacy` extra that nothing imports.
+
+All root causes are confirmed in code. Goal: fix all four plus encode the method lessons
+in SKILL.md so agents don't repeat the investigation error.
+
+## Fix 1 (P0): query-relevant snippets for non-BM25 hits
+
+**Files:** `src/muck/search/query.py`
+
+Today `snippets` is filled only by the BM25 leg (`query.py:89`); vector-leg hits in hybrid
+mode, all semantic-mode hits, and all `search_in_entity` hits (passes `{}`) fall to the
+chunk-head fallback at `query.py:56`.
+
+- Add `_best_window(text, query, qvec=None, emb=None, width=220) -> str` in `query.py`:
+  - Sentence-split the chunk with a simple regex (e.g. split on `(?<=[.!?])\s+` and blank
+    lines), tracking each sentence's char offset. No new deps.
+  - If `emb` and `qvec` are available: `emb.embed(sentences)` in one batch (vectors are
+    L2-normalized, so dot = cosine — same idiom as `search_in_entity` at `query.py:171`),
+    pick the argmax sentence.
+  - Else (no embedder): pick the sentence with max distinct-content-word overlap with the
+    query (lowercased tokens, len ≥ 3); if best overlap is 0, fall back to chunk head.
+  - Center a ~220-char window on the winning sentence, with `…` edge markers like
+    `_snippet` in `sqlite_store.py:41-48`. Empty text / no sentences → current chunk-head
+    behavior.
+- Thread context into `_build_hits`: extend signature to
+  `_build_hits(conn, ordered_ids, snippets, mode, query="", qvec=None, emb=None)` and at
+  line 56 use `snippets.get(cid) or _best_window(r["text"], query, qvec, emb)`.
+- Callers:
+  - `search()` (`query.py:103`): hoist `emb`/`qvec` (currently locals inside the
+    semantic/hybrid branch, lines 91-94) and pass them plus `query`. In keyword mode both
+    are None — every hit has an FTS5 snippet anyway; lexical fallback covers stragglers.
+  - `search_in_entity()`: pass `query, qvec, emb` at the cosine path (`query.py:176`);
+    leave the no-query path (`:156`) as-is (nothing to be relevant to); the BM25-in-entity
+    path (`:185`) already has snippets.
+- Reranker is unaffected — it reranks on `citation.quote` (full chunk), `query.py:109`.
+- Cost: Potion is a static CPU embedder (~µs/sentence); only hits *lacking* an FTS5
+  snippet are processed (≤ pool ≈ 20-40 chunks × ~10-20 sentences).
+
+## Fix 2 (P0): grep totals, `--all`, deterministic order
+
+**Files:** `src/muck/stores/sqlite_store.py`, `src/muck/search/query.py`, `src/muck/cli.py`
+
+- `SqliteStore.grep` (`sqlite_store.py:87-99`): drop `LIMIT ?`, add
+  `ORDER BY c.doc_id, c.char_start`, iterate the cursor in a single scan — count every
+  match, keep the first `k` for output (`k <= 0` means keep all). Return `(rows, total)`
+  where rows are `(chunk_id, snippet)` as before. (One full scan replaces the early-exit
+  LIMIT scan; that's the price of an exact total and it's the same cost `--all` pays.)
+- `query.grep` (`query.py:188-193`): return `(list[Hit], total)`.
+- CLI `grep` (`cli.py:180-192`): add `all_matches: bool = typer.Option(False, "--all",
+  help="Return every match (same as -k 0)")`; `if all_matches: k = 0`. Emit an **object
+  envelope** instead of the bare array:
+  ```json
+  {"total_matches": N, "returned": M, "truncated": true, "hits": [ ...Hit dicts... ]}
+  ```
+  Precedent: `reader` output uses a `returned` count key; `run_index` conditionally adds
+  advisory keys. This is an intentional output-shape change for `grep` only (`search`
+  stays a bare array). Log `total` in the tracelog call args.
+- Only three call sites exist (cli.py:189, query.py:190 internal, one test) —
+  `TurbovecStore` does not override grep.
+
+## Fix 3 (P1): whitespace-tolerant grep patterns
+
+**Files:** `src/muck/stores/sqlite_store.py`
+
+- Add module-level `_ws_tolerant(pattern: str) -> str`: a small character scanner that
+  tracks backslash-escapes and `[...]` character-class state, and rewrites runs of
+  literal, unescaped, outside-class spaces to `\s+`. Rules:
+  - `\ ` (escaped space) and spaces inside `[...]` are untouched.
+  - A single space immediately followed by a quantifier (`?`, `*`, `+`, `{`) becomes `\s`
+    (so `a ?b` → `a\s?b`, preserving "optional whitespace" intent).
+  - Any other run of spaces → `\s+`.
+- Apply once at the top of `SqliteStore.grep` — the single choke point feeding both the
+  SQL `regexp()` UDF parameter and the per-row `re.search` at `sqlite_store.py:97`, so
+  the two matching paths can never disagree. Default-on, no flag (grep's users are agents
+  searching phrases in PDF-extracted text; this matches `verify`'s `_norm` semantics at
+  `cite.py:81-82`).
+- Update the grep command help text in `cli.py` to say spaces match across line breaks.
+
+## Fix 4 (P2): notice when entity resolution is inert; spacy extra
+
+**Files:** `src/muck/pipeline.py`, `pyproject.toml`
+
+- In `run_index` (`pipeline.py:280-287`), after `result["entity_index"] = build_entities(...)`:
+  if the corpus has parsed docs (`doc_type IN` `PARSER_TYPES`) and zero docs with
+  `structured_json IS NOT NULL`, add (following the existing `config_drift`
+  conditional-key pattern at `pipeline.py:284-286`):
+  ```python
+  result["notice"] = (
+      "entity extraction is minimal on this corpus: mentions come from JSON "
+      "entity_fields (none here) plus bill-number regex, so --person/--org filters "
+      "and the entity network will be empty. search/grep/read/aggregate/cluster "
+      "are unaffected."
+  )
+  ```
+- Mirror the same conditional notice in `status()` (`pipeline.py:293-326`), where the
+  misleading `entities`/`mentions` counts actually appear. Also remove the duplicated
+  `return result` at `pipeline.py:327` (dead line) while touching this function.
+- **Decision point (recommend: remove):** delete the unwired `spacy` extra from
+  `pyproject.toml:23` and from the `all` aggregate (`:30`) — it promises capability that
+  doesn't exist (zero imports confirmed). Alternative if the user prefers: keep it and
+  file wiring an optional spaCy NER mention extractor as future work. Do NOT build the
+  NER integration now.
+
+## SKILL.md + docs
+
+**Files:** `skill/SKILL.md`, `skill/references/QUERIES.md`, then sync installed copies.
+
+- `## Investigation loop` **Find** bullet (lines 60-61): document that grep output is
+  `{total_matches, returned, truncated, hits}`; use `--all` (or `-k 0`) whenever the
+  question is enumerative; note grep treats spaces as `\s+` (matches across PDF line
+  breaks). Add: "Before dismissing a hit, read `citation.quote` (the full chunk) — the
+  snippet is a preview, not the evidence."
+- Add an **Enumerate** bullet to the Investigation loop: for "list all X / which
+  countries…" questions, never bound the answer with ranked top-k; use `muck grep
+  "<term>" --all`, group hits by document, and read every hit — absence from a top-k list
+  is not evidence of absence. Include the corpus-vocabulary check: search the corpus's own
+  terms for an action (e.g. "suspension" vs "termination/expulsion") before concluding it
+  never happened.
+- `## Citation discipline` step 1 (line 87): change "verbatim from the snippet" → quote
+  from `citation.quote` (snippets can contain `[`/`]` FTS5 match markers and `…` that
+  break `verify`).
+- `skill/references/QUERIES.md:50` (revolving-door grep sweep): add `--all` since it's an
+  enumeration pattern.
+- Sync: copy updated `skill/SKILL.md` (and touched references) over
+  `~/.claude/skills/muck/` (currently byte-identical copies).
+
+## Tests
+
+All in `tests/test_pipeline_e2e.py`, following its existing builder style
+(`build(tmp_path, embeddings)` etc.):
+
+- Update `test_grep_exact_string` (line 77-81) for the new `(hits, total)` return.
+- `test_grep_total_and_all`: pattern matching many chunks with small k → `total > returned`;
+  `k=0` returns all `total` hits; hits ordered by (doc_id, char_start).
+- `test_grep_phrase_across_linebreak`: write a txt fixture into the tmp corpus containing
+  a phrase broken by `\r\n` mid-phrase; `q.grep(conn, settings, "the exact phrase", 10)`
+  finds it.
+- `test_ws_tolerant_translation`: direct unit assertions on `_ws_tolerant` — plain phrase
+  → `\s+`; `[a ]` untouched; `\ ` untouched; `a ?b` → `a\s?b`.
+- `test_snippet_query_relevant_for_semantic_hits`: corpus where the relevant sentence is
+  NOT at chunk head; `q.search(..., "semantic", k)` → hit snippet contains the relevant
+  term. Guard with the same skip-if-model-unavailable pattern as
+  `test_embedding_path_optional` (line 562). Add a companion no-embedder case exercising
+  the lexical-overlap fallback via `search_in_entity`/keyword-off path.
+- `test_index_notice_pure_parsed_corpus`: build a corpus of only txt files → `run_index`
+  result contains `notice`; JSON-bearing corpus → no `notice`.
+
+## Verification (in order)
+
+1. `uv run pytest tests/` — all green.
+2. Reinstall (muck is installed **non-editable**; src edits don't take effect until):
+   `uv sync --no-editable`.
+3. Acceptance on the real corpus (run from `/Users/vibes/Documents/Development/Projects/anna`;
+   all commands are read-path only — do NOT re-run `muck index` against the real index,
+   the notice is covered by unit tests):
+   - `muck search "member removed from ANNA lost membership" -k 5` → the
+     Admin_Report_for_2017 hit's snippet contains "Nairobi".
+   - `muck grep "suspen" -k 5` → 5 hits and `"total_matches": 16`.
+   - `muck grep "Libyan Stock Market"` → includes chunk `f2035af77c6.0@1528-3479`.
+   - End-to-end re-run of the failed question:
+     `muck search "which stock exchanges had their ANNA membership suspended" -k 8` plus
+     `muck grep "suspension of their" --all` together surface Philippines
+     (`fcdba353ed7.0@29499-31344`) and Kenya + Libya (`f2035af77c6.0@1528-3479`) with
+     relevance-visible snippets.
+
+## Risks / notes
+
+- Grep's exact total forces a full regexp scan per grep (no early LIMIT exit). Acceptable:
+  correctness for enumeration outweighs it, and `--all` pays the same cost anyway.
+- The grep CLI output shape changes from bare array to object — the consumer is the agent
+  skill, updated in the same change; SKILL.md documents the new shape.
+- `_ws_tolerant` changes matching semantics for regexes that used a bare space to mean
+  "exactly one space". This is intended (aligns grep with verify's `_norm`) and the
+  escaped-space/class carve-outs preserve an opt-out (`\ `).
+- Snippet changes have zero existing-test exposure (nothing asserts on `Hit.snippet`
+  today) — the new tests pin the improved behavior.
+
+```
+
+
+**Tool Call: ToolSearch**
+Status: Completed
+
+Tool: ExitPlanMode
+
+**Tool Call: Exited Plan Mode**
+Status: Completed
+
+# muck field-report fixes: retrieval display & completeness
+
+## Context
+
+A field report from a real investigation (596 archived ANNA PDFs, index at
+`/Users/vibes/Documents/Development/Projects/anna/.muck/index.db`) documented a factual
+error caused by three tool failures plus one silent degradation:
+
+1. **P0** — Hybrid/semantic search hits that weren't in the BM25 pool display the chunk
+   *head* as snippet instead of a query-relevant window, so agents dismiss correct hits.
+2. **P0** — `muck grep` silently truncates at `-k` in insertion order with no total count,
+   so agents treat a top-k slice as the full universe for enumeration questions.
+3. **P1** — Literal-phrase grep fails across PDF line breaks (`"Libyan \r\nStock Market"`),
+   while `muck verify` normalizes whitespace — the discovery tool is stricter than the
+   verification tool.
+4. **P2** — Entity resolution is silently inert on pure-PDF corpora (gazetteer needs JSON
+   `entity_fields`); `pyproject.toml` also declares a `spacy` extra that nothing imports.
+
+All root causes are confirmed in code. Goal: fix all four plus encode the method lessons
+in SKILL.md so agents don't repeat the investigation error.
+
+## Fix 1 (P0): query-relevant snippets for non-BM25 hits
+
+**Files:** `src/muck/search/query.py`
+
+Today `snippets` is filled only by the BM25 leg (`query.py:89`); vector-leg hits in hybrid
+mode, all semantic-mode hits, and all `search_in_entity` hits (passes `{}`) fall to the
+chunk-head fallback at `query.py:56`.
+
+- Add `_best_window(text, query, qvec=None, emb=None, width=220) -> str` in `query.py`:
+  - Sentence-split the chunk with a simple regex (e.g. split on `(?<=[.!?])\s+` and blank
+    lines), tracking each sentence's char offset. No new deps.
+  - If `emb` and `qvec` are available: `emb.embed(sentences)` in one batch (vectors are
+    L2-normalized, so dot = cosine — same idiom as `search_in_entity` at `query.py:171`),
+    pick the argmax sentence.
+  - Else (no embedder): pick the sentence with max distinct-content-word overlap with the
+    query (lowercased tokens, len ≥ 3); if best overlap is 0, fall back to chunk head.
+  - Center a ~220-char window on the winning sentence, with `…` edge markers like
+    `_snippet` in `sqlite_store.py:41-48`. Empty text / no sentences → current chunk-head
+    behavior.
+- Thread context into `_build_hits`: extend signature to
+  `_build_hits(conn, ordered_ids, snippets, mode, query="", qvec=None, emb=None)` and at
+  line 56 use `snippets.get(cid) or _best_window(r["text"], query, qvec, emb)`.
+- Callers:
+  - `search()` (`query.py:103`): hoist `emb`/`qvec` (currently locals inside the
+    semantic/hybrid branch, lines 91-94) and pass them plus `query`. In keyword mode both
+    are None — every hit has an FTS5 snippet anyway; lexical fallback covers stragglers.
+  - `search_in_entity()`: pass `query, qvec, emb` at the cosine path (`query.py:176`);
+    leave the no-query path (`:156`) as-is (nothing to be relevant to); the BM25-in-entity
+    path (`:185`) already has snippets.
+- Reranker is unaffected — it reranks on `citation.quote` (full chunk), `query.py:109`.
+- Cost: Potion is a static CPU embedder (~µs/sentence); only hits *lacking* an FTS5
+  snippet are processed (≤ pool ≈ 20-40 chunks × ~10-20 sentences).
+
+## Fix 2 (P0): grep totals, `--all`, deterministic order
+
+**Files:** `src/muck/stores/sqlite_store.py`, `src/muck/search/query.py`, `src/muck/cli.py`
+
+- `SqliteStore.grep` (`sqlite_store.py:87-99`): drop `LIMIT ?`, add
+  `ORDER BY c.doc_id, c.char_start`, iterate the cursor in a single scan — count every
+  match, keep the first `k` for output (`k <= 0` means keep all). Return `(rows, total)`
+  where rows are `(chunk_id, snippet)` as before. (One full scan replaces the early-exit
+  LIMIT scan; that's the price of an exact total and it's the same cost `--all` pays.)
+- `query.grep` (`query.py:188-193`): return `(list[Hit], total)`.
+- CLI `grep` (`cli.py:180-192`): add `all_matches: bool = typer.Option(False, "--all",
+  help="Return every match (same as -k 0)")`; `if all_matches: k = 0`. Emit an **object
+  envelope** instead of the bare array:
+  ```json
+  {"total_matches": N, "returned": M, "truncated": true, "hits": [ ...Hit dicts... ]}
+  ```
+  Precedent: `reader` output uses a `returned` count key; `run_index` conditionally adds
+  advisory keys. This is an intentional output-shape change for `grep` only (`search`
+  stays a bare array). Log `total` in the tracelog call args.
+- Only three call sites exist (cli.py:189, query.py:190 internal, one test) —
+  `TurbovecStore` does not override grep.
+
+## Fix 3 (P1): whitespace-tolerant grep patterns
+
+**Files:** `src/muck/stores/sqlite_store.py`
+
+- Add module-level `_ws_tolerant(pattern: str) -> str`: a small character scanner that
+  tracks backslash-escapes and `[...]` character-class state, and rewrites runs of
+  literal, unescaped, outside-class spaces to `\s+`. Rules:
+  - `\ ` (escaped space) and spaces inside `[...]` are untouched.
+  - A single space immediately followed by a quantifier (`?`, `*`, `+`, `{`) becomes `\s`
+    (so `a ?b` → `a\s?b`, preserving "optional whitespace" intent).
+  - Any other run of spaces → `\s+`.
+- Apply once at the top of `SqliteStore.grep` — the single choke point feeding both the
+  SQL `regexp()` UDF parameter and the per-row `re.search` at `sqlite_store.py:97`, so
+  the two matching paths can never disagree. Default-on, no flag (grep's users are agents
+  searching phrases in PDF-extracted text; this matches `verify`'s `_norm` semantics at
+  `cite.py:81-82`).
+- Update the grep command help text in `cli.py` to say spaces match across line breaks.
+
+## Fix 4 (P2): notice when entity resolution is inert; spacy extra
+
+**Files:** `src/muck/pipeline.py`, `pyproject.toml`
+
+- In `run_index` (`pipeline.py:280-287`), after `result["entity_index"] = build_entities(...)`:
+  if the corpus has parsed docs (`doc_type IN` `PARSER_TYPES`) and zero docs with
+  `structured_json IS NOT NULL`, add (following the existing `config_drift`
+  conditional-key pattern at `pipeline.py:284-286`):
+  ```python
+  result["notice"] = (
+      "entity extraction is minimal on this corpus: mentions come from JSON "
+      "entity_fields (none here) plus bill-number regex, so --person/--org filters "
+      "and the entity network will be empty. search/grep/read/aggregate/cluster "
+      "are unaffected."
+  )
+  ```
+- Mirror the same conditional notice in `status()` (`pipeline.py:293-326`), where the
+  misleading `entities`/`mentions` counts actually appear. Also remove the duplicated
+  `return result` at `pipeline.py:327` (dead line) while touching this function.
+- **Decision point (recommend: remove):** delete the unwired `spacy` extra from
+  `pyproject.toml:23` and from the `all` aggregate (`:30`) — it promises capability that
+  doesn't exist (zero imports confirmed). Alternative if the user prefers: keep it and
+  file wiring an optional spaCy NER mention extractor as future work. Do NOT build the
+  NER integration now.
+
+## SKILL.md + docs
+
+**Files:** `skill/SKILL.md`, `skill/references/QUERIES.md`, then sync installed copies.
+
+- `## Investigation loop` **Find** bullet (lines 60-61): document that grep output is
+  `{total_matches, returned, truncated, hits}`; use `--all` (or `-k 0`) whenever the
+  question is enumerative; note grep treats spaces as `\s+` (matches across PDF line
+  breaks). Add: "Before dismissing a hit, read `citation.quote` (the full chunk) — the
+  snippet is a preview, not the evidence."
+- Add an **Enumerate** bullet to the Investigation loop: for "list all X / which
+  countries…" questions, never bound the answer with ranked top-k; use `muck grep
+  "<term>" --all`, group hits by document, and read every hit — absence from a top-k list
+  is not evidence of absence. Include the corpus-vocabulary check: search the corpus's own
+  terms for an action (e.g. "suspension" vs "termination/expulsion") before concluding it
+  never happened.
+- `## Citation discipline` step 1 (line 87): change "verbatim from the snippet" → quote
+  from `citation.quote` (snippets can contain `[`/`]` FTS5 match markers and `…` that
+  break `verify`).
+- `skill/references/QUERIES.md:50` (revolving-door grep sweep): add `--all` since it's an
+  enumeration pattern.
+- Sync: copy updated `skill/SKILL.md` (and touched references) over
+  `~/.claude/skills/muck/` (currently byte-identical copies).
+
+## Tests
+
+All in `tests/test_pipeline_e2e.py`, following its existing builder style
+(`build(tmp_path, embeddings)` etc.):
+
+- Update `test_grep_exact_string` (line 77-81) for the new `(hits, total)` return.
+- `test_grep_total_and_all`: pattern matching many chunks with small k → `total > returned`;
+  `k=0` returns all `total` hits; hits ordered by (doc_id, char_start).
+- `test_grep_phrase_across_linebreak`: write a txt fixture into the tmp corpus containing
+  a phrase broken by `\r\n` mid-phrase; `q.grep(conn, settings, "the exact phrase", 10)`
+  finds it.
+- `test_ws_tolerant_translation`: direct unit assertions on `_ws_tolerant` — plain phrase
+  → `\s+`; `[a ]` untouched; `\ ` untouched; `a ?b` → `a\s?b`.
+- `test_snippet_query_relevant_for_semantic_hits`: corpus where the relevant sentence is
+  NOT at chunk head; `q.search(..., "semantic", k)` → hit snippet contains the relevant
+  term. Guard with the same skip-if-model-unavailable pattern as
+  `test_embedding_path_optional` (line 562). Add a companion no-embedder case exercising
+  the lexical-overlap fallback via `search_in_entity`/keyword-off path.
+- `test_index_notice_pure_parsed_corpus`: build a corpus of only txt files → `run_index`
+  result contains `notice`; JSON-bearing corpus → no `notice`.
+
+## Verification (in order)
+
+1. `uv run pytest tests/` — all green.
+2. Reinstall (muck is installed **non-editable**; src edits don't take effect until):
+   `uv sync --no-editable`.
+3. Acceptance on the real corpus (run from `/Users/vibes/Documents/Development/Projects/anna`;
+   all commands are read-path only — do NOT re-run `muck index` against the real index,
+   the notice is covered by unit tests):
+   - `muck search "member removed from ANNA lost membership" -k 5` → the
+     Admin_Report_for_2017 hit's snippet contains "Nairobi".
+   - `muck grep "suspen" -k 5` → 5 hits and `"total_matches": 16`.
+   - `muck grep "Libyan Stock Market"` → includes chunk `f2035af77c6.0@1528-3479`.
+   - End-to-end re-run of the failed question:
+     `muck search "which stock exchanges had their ANNA membership suspended" -k 8` plus
+     `muck grep "suspension of their" --all` together surface Philippines
+     (`fcdba353ed7.0@29499-31344`) and Kenya + Libya (`f2035af77c6.0@1528-3479`) with
+     relevance-visible snippets.
+
+## Risks / notes
+
+- Grep's exact total forces a full regexp scan per grep (no early LIMIT exit). Acceptable:
+  correctness for enumeration outweighs it, and `--all` pays the same cost anyway.
+- The grep CLI output shape changes from bare array to object — the consumer is the agent
+  skill, updated in the same change; SKILL.md documents the new shape.
+- `_ws_tolerant` changes matching semantics for regexes that used a bare space to mean
+  "exactly one space". This is intended (aligns grep with verify's `_norm`) and the
+  escaped-space/class carve-outs preserve an opt-out (`\ `).
+- Snippet changes have zero existing-test exposure (nothing asserts on `Hit.snippet`
+  today) — the new tests pin the improved behavior.
+
+
+**Tool Call: Edit src/muck/search/query.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/search/query.py
+```
+from __future__ import annotations
+
+import re
+import sqlite3
+
+from ..cite import make_citation
+```
+
+
+**Tool Call: Edit src/muck/search/query.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/search/query.py
+```
+_SENT_BREAK = re.compile(r"(?<=[.!?])\s+|(?:\r?\n){2,}")
+_WORD = re.compile(r"[\w'-]{3,}")
+
+
+def _best_window(text: str, query: str, qvec=None, emb=None, width: int = 220) -> str:
+    """Query-relevant snippet: a window around the sentence most relevant to the query.
+
+    Scores sentences by cosine against the query vector when an embedder is in hand
+    (vector-leg hits have no FTS5 snippet), else by content-word overlap. Falls back to
+    the chunk head when nothing scores.
+    """
+    head = text[:width].strip() + ("…" if len(text) > width else "")
+    spans, start = [], 0
+    for m in _SENT_BREAK.finditer(text):
+        if text[start : m.start()].strip():
+            spans.append((start, m.start()))
+        start = m.end()
+    if text[start:].strip():
+        spans.append((start, len(text)))
+    if len(spans) < 2 or not query:
+        return head
+
+    if emb is not None and qvec is not None:
+        sims = (emb.embed([text[s:e].strip() for s, e in spans]) @ qvec).tolist()
+        best = max(range(len(sims)), key=sims.__getitem__)
+    else:
+        terms = set(_WORD.findall(query.lower()))
+        overlaps = [len(terms & set(_WORD.findall(text[s:e].lower()))) for s, e in spans]
+        best = max(range(len(overlaps)), key=overlaps.__getitem__)
+        if overlaps[best] == 0:
+            return head
+
+    s, e = spans[best]
+    if e - s >= width:
+        lo, hi = s, s + width
+    else:
+        lo = max(0, s - (width - (e - s)) // 2)
+        hi = min(len(text), lo + width)
+        lo = max(0, hi - width)
+    return ("…" if lo else "") + text[lo:hi].strip() + ("…" if hi < len(text) else "")
+
+
+def _build_hits(conn, ordered_ids, snippets, mode, query="", qvec=None, emb=None) -> list[Hit]:
+    if not ordered_ids:
+        return []
+```
+
+
+**Tool Call: Edit src/muck/search/query.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/search/query.py
+```
+        snippet = snippets.get(cid) or _best_window(r["text"], query, qvec, emb)
+```
+
+
+## Assistant
+
+Now hoist `emb`/`qvec` in `search()` and thread them through:
+
+**Tool Call: Edit src/muck/search/query.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/search/query.py
+```
+    bm_ids: list[str] = []
+    vec_ids: list[str] = []
+    snippets: dict[str, str] = {}
+    emb = qvec = None
+
+    if mode in ("keyword", "hybrid"):
+        bm_res = store.search_bm25(conn, query, pool, filters)
+        bm_ids = [cid for cid, _, _ in bm_res]
+        snippets = {cid: snip for cid, _, snip in bm_res}
+
+    if mode in ("semantic", "hybrid") and has_vec:
+        emb = build_embedder(settings)
+        qvec = emb.embed([query])[0]
+        vec_ids = [cid for cid, _ in store.search_vector(conn, qvec, pool, filters)]
+
+    if mode == "keyword":
+        ordered = bm_ids
+    elif mode == "semantic":
+        ordered = vec_ids
+    else:
+        ordered = _rrf([bm_ids, vec_ids])
+
+    hits = _build_hits(conn, ordered[:pool], snippets, mode, query, qvec, emb)
+```
+
+
+**Tool Call: Edit src/muck/search/query.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/search/query.py
+```
+        hits = _build_hits(conn, [i for i, _ in scored], {}, label, query, qvec, emb)
+```
+
+
+## Assistant
+
+Fix 1 is in. Now Fixes 2 and 3 in `sqlite_store.py` — the whitespace-tolerant pattern translator plus the single-scan grep with totals and deterministic ordering:
+
+**Tool Call: Edit src/muck/stores/sqlite\_store.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/stores/sqlite_store.py
+```
+def _ws_tolerant(pattern: str) -> str:
+    """Rewrite literal spaces to ``\\s+`` so phrases match across PDF line breaks.
+
+    Escaped spaces and spaces inside ``[...]`` classes are untouched; a single space
+    directly before a quantifier becomes ``\\s`` so the quantifier keeps its meaning.
+    """
+    out: list[str] = []
+    i, in_class = 0, False
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern):
+            out.append(pattern[i : i + 2])
+            i += 2
+            continue
+        if ch == "[" and not in_class:
+            in_class = True
+        elif ch == "]" and in_class:
+            in_class = False
+        elif ch == " " and not in_class:
+            j = i
+            while j < len(pattern) and pattern[j] == " ":
+                j += 1
+            nxt = pattern[j] if j < len(pattern) else ""
+            out.append(r"\s" if (j - i == 1 and nxt in "?*+{") else r"\s+")
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _snippet(text: str, around: str | None = None, width: int = 220) -> str:
+```
+
+
+**Tool Call: Edit src/muck/stores/sqlite\_store.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/stores/sqlite_store.py
+```
+    def grep(self, conn, pattern, k, filters=None):
+        pattern = _ws_tolerant(pattern)
+        where, params = _filter_sql(filters)
+        sql = (
+            "SELECT c.chunk_id AS chunk_id, c.text AS text FROM chunks c "
+            "JOIN documents d ON d.doc_id = c.doc_id "
+            "WHERE regexp(?, c.text)" + where + " ORDER BY c.doc_id, c.char_start"
+        )
+        # Single full scan: exact total alongside the first k hits (k <= 0 keeps all).
+        out, total = [], 0
+        for r in conn.execute(sql, [pattern, *params]):
+            total += 1
+            if k <= 0 or len(out) < k:
+                m = re.search(pattern, r["text"], re.IGNORECASE)
+                out.append((r["chunk_id"], _snippet(r["text"], m.group(0) if m else None)))
+        return out, total
+```
+
+
+## Assistant
+
+Now the `query.grep` wrapper and CLI:
+
+**Tool Call: Edit src/muck/search/query.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/search/query.py
+```
+def grep(conn, settings: Settings, pattern: str, k: int = 20, filters=None) -> tuple[list[Hit], int]:
+    """Regex hits (first ``k``; all when ``k <= 0``) plus the exact total match count."""
+    store = get_store(settings.store.backend)
+    res, total = store.grep(conn, pattern, k, filters)
+    ids = [cid for cid, _ in res]
+    snippets = {cid: snip for cid, snip in res}
+    return _build_hits(conn, ids, snippets, "grep"), total
+```
+
+
+**Tool Call: Edit src/muck/cli.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/cli.py
+```
+@app.command()
+def grep(
+    pattern: str,
+    k: int = typer.Option(20, "-k", "--k", help="Max hits to return (0 = all)"),
+    all_matches: bool = typer.Option(False, "--all", help="Return every match (same as -k 0)"),
+    doc_type: str = typer.Option(None),
+    doc_id: str = typer.Option(None),
+):
+    """Regex search for exact strings (bill numbers, names, IDs).
+
+    Literal spaces match any whitespace (PDF line breaks included). Output reports
+    total_matches/truncated so a capped result set is visible; use --all to enumerate.
+    """
+    muck_dir, settings, conn = _resolve()
+    if all_matches:
+        k = 0
+    hits, total = query_mod.grep(conn, settings, pattern, k, _filters(doc_type, doc_id, None))
+    out = {
+        "total_matches": total,
+        "returned": len(hits),
+        "truncated": total > len(hits),
+        "hits": [h.to_dict() for h in hits],
+    }
+    tracelog.log(conn, muck_dir, "grep", {"pattern": pattern, "k": k, "total_matches": total},
+                 n_results=len(hits))
+    _emit(out)
+```
+
+
+## Assistant
+
+Now Fix 4 — the entity-inertness notice in `pipeline.py`:
+
+**Tool Call: Edit src/muck/pipeline.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/pipeline.py
+```
+    if settings.entities.resolve:
+        from .extract.entities import build_entities
+
+        result["entity_index"] = build_entities(conn, settings)
+        notice = _entity_inertia_notice(conn)
+        if notice:
+            result["notice"] = notice
+    drift = field_map_drift(conn, settings)
+    if drift:
+        result["config_drift"] = drift
+    return result
+
+
+def _entity_inertia_notice(conn) -> str | None:
+    """Explain near-empty entity counts on parse-only corpora (no JSON entity_fields)."""
+    ph = ",".join("?" * len(PARSER_TYPES))
+    parsed = conn.execute(
+        f"SELECT COUNT(*) FROM documents WHERE doc_type IN ({ph})", sorted(PARSER_TYPES)
+    ).fetchone()[0]
+    structured = conn.execute(
+        "SELECT COUNT(*) FROM documents WHERE structured_json IS NOT NULL"
+    ).fetchone()[0]
+    if parsed and not structured:
+        return (
+            "entity extraction is minimal on this corpus: mentions come from JSON "
+            "entity_fields (none here) plus bill-number regex, so --person/--org "
+            "filters and the entity network will be empty. "
+            "search/grep/read/aggregate/cluster are unaffected."
+        )
+    return None
+```
+
+
+**Tool Call: Edit src/muck/pipeline.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/pipeline.py
+```
+    drift = field_map_drift(conn, settings)
+    if drift:
+        result["config_drift"] = drift
+    notice = _entity_inertia_notice(conn)
+    if notice:
+        result["notice"] = notice
+    return result
+```
+
+
+**Tool Call: Read pyproject.toml**
+Status: Completed
+
+```
+1	[project]
+2	name = "muck"
+3	version = "0.1.0"
+4	description = "Modular many-document investigation pipeline for AI agents — JSON/PDF corpora, citation-verified retrieval, packaged as a Claude skill."
+5	readme = "README.md"
+6	requires-python = ">=3.11"
+7	dependencies = [
+8	    "typer>=0.12",
+9	    "pydantic>=2.6",
+10	    "numpy>=1.26",
+11	    "pypdfium2>=4.30",
+12	    "sqlite-vec>=0.1.6",
+13	    # Potion embeddings are default-on (CPU, no API, no torch for inference).
+14	    "model2vec>=0.3",
+15	]
+16	
+17	[project.optional-dependencies]
+18	# Structured analytics + clustering (Phase 2).
+19	analytics = ["duckdb>=1.0", "scikit-learn>=1.4"]
+20	# Upgrade adapters (Phase 3).
+21	docx = ["python-docx>=1.1"]
+22	sbert = ["sentence-transformers>=3.0"]
+23	spacy = ["spacy>=3.7"]
+24	docling = ["docling>=2.0"]
+25	pymupdf = ["pymupdf>=1.24"]
+26	api = ["httpx>=0.27"]
+27	splink = ["splink>=4.0"]
+28	turbovec = ["turbovec>=0.8"]  # in-memory ANN accelerator for large corpora (needs arm64/linux wheel)
+29	all = [
+30	    "muck[analytics,docx,sbert,spacy,docling,pymupdf,api,splink,turbovec]",
+31	]
+32	
+33	[project.scripts]
+34	muck = "muck.cli:app"
+35	
+36	[tool.uv]
+37	dev-dependencies = ["pytest>=8"]
+38	
+39	[build-system]
+40	requires = ["hatchling"]
+41	build-backend = "hatchling.build"
+42	
+43	[tool.hatch.build.targets.wheel]
+44	packages = ["src/muck"]
+45	
+```
+
+**Tool Call: Edit pyproject.toml**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/pyproject.toml
+```
+sbert = ["sentence-transformers>=3.0"]
+docling = ["docling>=2.0"]
+```
+
+
+**Tool Call: Edit pyproject.toml**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/pyproject.toml
+```
+    "muck[analytics,docx,sbert,docling,pymupdf,api,splink,turbovec]",
+```
+
+
+**Tool Call: Edit skill/SKILL.md**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/skill/SKILL.md
+```
+- **Find:** `muck search "<question>"` (auto = hybrid keyword+semantic; degrades to keyword
+  if embeddings are off). Use `muck grep "<regex>"` for exact strings (bill numbers, IDs);
+  literal spaces in the pattern match across line breaks in PDF text. grep returns
+  `{total_matches, returned, truncated, hits}` — when `truncated` is true you have NOT
+  seen every match. Snippets are previews, not evidence: before dismissing a hit, read its
+  `citation.quote` (the full chunk).
+- **Enumerate:** for "list all X / which countries…" questions, never bound the answer
+  with ranked top-k results — run `muck grep "<term>" --all`, group hits by document, and
+  read every one. Absence from a top-k list is not evidence of absence. And check the
+  corpus's *own* vocabulary before concluding an event never happened (a corpus may say
+  "suspension" where you'd say "termination" or "expulsion").
+```
+
+
+**Tool Call: Edit skill/SKILL.md**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/skill/SKILL.md
+```
+1. Quote the supporting text **verbatim** from `citation.quote` (the full chunk) — not
+   from the `snippet`, whose `[`/`]` match markers and `…` ellipses break verification.
+```
+
+
+**Tool Call: Read skill/references/QUERIES.md (36 - 65)**
+Status: Completed
+
+```
+36	```
+37	muck aggregate --by filing_period --agg count            # volume per period
+38	muck aggregate --sql "SELECT json_extract(structured_json,'$.filing_period') AS period, \
+39	  SUM(CAST(json_extract(structured_json,'$.amount') AS REAL)) AS spend \
+40	  FROM documents GROUP BY period ORDER BY period"
+41	```
+42	Cross with events from press releases: `muck search "<bill or event>"`, read dates, compare
+43	to the spend timeline. Cite the filing and the press release for any timing claim.
+44	
+45	## 4. Revolving-door detector (firm ↔ government)
+46	Surface people connected to both private firms and government offices.
+47	```
+48	muck entities --type person --min-count 2                # candidates
+49	muck entities --entity <person_id>                       # which orgs they co-occur with
+50	muck grep "(formerly|previously|chief of staff|served as|now at|joined)"   # role-change language
+51	```
+52	A person whose `co_occurring` orgs include both a registrant/firm and a government office,
+53	or whose mentions span a firm filing and a government press release, is a lead. Confirm each
+54	leg with `muck verify` before asserting a move.
+55	
+56	## 5. Entity-filtered semantic search (person/org = X AND cosine to Y)
+57	Find chunks that **mention a specific resolved entity** and rank them by similarity to a
+58	query — the structured filter + vector query in one step.
+59	```
+60	muck search "prescription drug pricing" --person "Jane Doe"        # her chunks, cosine-ranked
+61	muck search "defense procurement"        --org "Acme" --min-score 0.3   # threshold on cosine
+62	muck search "" --entity <entity_id>                                # all chunks for an entity, no query
+63	```
+64	Restricts to the entity's chunks (merged aliases + cross-source mentions included), then
+65	ranks by true cosine to the query; `--min-score` filters by similarity. Each hit keeps its
+```
+
+**Tool Call: Edit skill/references/QUERIES.md**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/skill/references/QUERIES.md
+```
+muck grep "(formerly|previously|chief of staff|served as|now at|joined)" --all   # role-change language, every match
+```
+
+
+## Assistant
+
+Now the tests. Let me look at the existing test file structure:
+
+**Tool Call: Read tests/test_pipeline_e2e.py (1 - 140)**
+Status: Completed
+
+```
+1	"""End-to-end: ingest -> map/parse -> index -> search -> cite/verify.
+2	
+3	The keyword path needs no network (no model download), so this runs offline. A separate
+4	test exercises the embedding path and skips if the model can't be loaded.
+5	"""
+6	
+7	from __future__ import annotations
+8	
+9	import shutil
+10	from pathlib import Path
+11	
+12	import pytest
+13	
+14	import muck.embedders  # noqa: F401  (register adapters)
+15	import muck.mappers  # noqa: F401
+16	import muck.parsers  # noqa: F401
+17	import muck.stores  # noqa: F401
+18	from muck import cite as citelib
+19	from muck import config as cfg
+20	from muck import pipeline
+21	from muck.db import DB_FILENAME, connect, init_schema
+22	from muck.search import query as q
+23	
+24	FIX = Path(__file__).parent / "fixtures"
+25	FILES = ["lobbying_sample.json", "press_release.txt"]
+26	
+27	
+28	def build(tmp_path: Path, embeddings: bool):
+29	    corpus = tmp_path / "corpus"
+30	    corpus.mkdir()
+31	    for f in FILES:
+32	        shutil.copy(FIX / f, corpus / f)
+33	    muck_dir = corpus / cfg.MUCK_DIRNAME
+34	    (muck_dir / "cache").mkdir(parents=True)
+35	    cfg.write_default_config(muck_dir)
+36	    settings = cfg.load_settings(muck_dir)
+37	    settings.embedder.enabled = embeddings
+38	    conn = connect(muck_dir / DB_FILENAME)
+39	    init_schema(conn)
+40	    pipeline.ingest(conn, [str(corpus / f) for f in FILES])
+41	    pipeline.extract(conn, settings, pipeline.MAPPER_TYPES)
+42	    pipeline.extract(conn, settings, pipeline.PARSER_TYPES)
+43	    result = pipeline.run_index(conn, settings)
+44	    return corpus, muck_dir, settings, conn, result
+45	
+46	
+47	def test_pipeline_and_citation_guard(tmp_path):
+48	    corpus, muck_dir, settings, conn, _ = build(tmp_path, embeddings=False)
+49	
+50	    st = pipeline.status(conn, settings)
+51	    assert st["documents"].get("indexed") == 4  # 3 filings + 1 press release
+52	    assert st["chunks"] >= 4
+53	    assert st["fts_rows"] == st["chunks"]
+54	
+55	    hits = q.search(conn, settings, "prescription drug pricing Medicare", "keyword", 5)
+56	    assert hits, "keyword search returned nothing"
+57	    top = hits[0]
+58	    assert top.citation.token and "@" in top.citation.token
+59	
+60	    # A real substring of the cited span verifies.
+61	    real_quote = "prescription drug pricing"
+62	    assert real_quote.lower() in top.citation.quote.lower()
+63	    v = citelib.verify(conn, settings, top.citation.token, real_quote)
+64	    assert v["token_valid"] and v["quote_supported"] and v["verified"]
+65	    assert v["source_confirmed"] is True  # re-derived from the original file
+66	
+67	    # A fabricated quote does NOT verify.
+68	    bad = citelib.verify(conn, settings, top.citation.token, "Acme paid undisclosed bribes zzqqxx")
+69	    assert bad["token_valid"] and not bad["quote_supported"] and not bad["verified"]
+70	
+71	    # A tampered token is rejected.
+72	    tampered = top.citation.token.rsplit("#", 1)[0] + "#deadbeef"
+73	    bad_tok = citelib.verify(conn, settings, tampered, real_quote)
+74	    assert not bad_tok["token_valid"] and not bad_tok["verified"]
+75	
+76	
+77	def test_grep_exact_string(tmp_path):
+78	    _, _, settings, conn, _ = build(tmp_path, embeddings=False)
+79	    hits = q.grep(conn, settings, r"H\.R\. 1234", 10)
+80	    assert len(hits) >= 2  # appears in filings + the press release
+81	    assert all(h.citation.token for h in hits)
+82	
+83	
+84	def test_idempotent_resume(tmp_path):
+85	    corpus, muck_dir, settings, conn, _ = build(tmp_path, embeddings=False)
+86	    # Re-running extract/index with only_new should be a no-op (resume-safe).
+87	    again_map = pipeline.extract(conn, settings, pipeline.MAPPER_TYPES, only_new=True)
+88	    again_idx = pipeline.run_index(conn, settings, only_new=True)
+89	    assert again_map["documents"] == 0
+90	    assert again_idx["documents"] == 0
+91	
+92	
+93	def build_with_entities(tmp_path: Path, embeddings: bool = False):
+94	    corpus = tmp_path / "corpus"
+95	    corpus.mkdir()
+96	    for f in FILES:
+97	        shutil.copy(FIX / f, corpus / f)
+98	    muck_dir = corpus / cfg.MUCK_DIRNAME
+99	    (muck_dir / "cache").mkdir(parents=True)
+100	    cfg.write_default_config(muck_dir)
+101	    settings = cfg.load_settings(muck_dir)
+102	    settings.embedder.enabled = embeddings  # offline by default; entities don't need embeddings
+103	    settings.mapper.fields = cfg.FieldMap(
+104	        record_path="/results",
+105	        record_id="filing_uuid",
+106	        structured_fields=["registrant", "client", "amount", "filing_period"],
+107	        entity_fields=["registrant:org", "client:org", "lobbyists:person"],
+108	    )
+109	    conn = connect(muck_dir / DB_FILENAME)
+110	    init_schema(conn)
+111	    pipeline.ingest(conn, [str(corpus / f) for f in FILES])
+112	    pipeline.extract(conn, settings, pipeline.MAPPER_TYPES)
+113	    pipeline.extract(conn, settings, pipeline.PARSER_TYPES)
+114	    pipeline.run_index(conn, settings)
+115	    return settings, conn
+116	
+117	
+118	def test_entity_resolution_and_crossref(tmp_path):
+119	    import muck.extract.entities as ent
+120	
+121	    settings, conn = build_with_entities(tmp_path)
+122	    orgs = ent.list_entities(conn, etype="org", name="Acme")
+123	    assert orgs, "Acme not resolved"
+124	    acme = ent.entity_detail(conn, orgs[0]["entity_id"])
+125	    # The two surface variants merge into one entity...
+126	    assert set(acme["aliases"]) == {"Acme Strategies LLC", "Acme Strategies, L.L.C."}
+127	    # ...and the press release links to the same entity (cross-source).
+128	    assert acme["doc_count"] == 3
+129	    assert any(m["source_path"].endswith("press_release.txt") for m in acme["mentions"])
+130	    # Distinct firm "Capitol Advisors Group" must NOT merge into Acme.
+131	    assert any(e["canonical_name"] == "Capitol Advisors Group" for e in ent.list_entities(conn, etype="org"))
+132	    # Bill numbers are extracted as entities.
+133	    assert ent.list_entities(conn, etype="bill")
+134	    # Every mention carries a citation token.
+135	    assert all("@" in m["token"] for m in acme["mentions"])
+136	
+137	
+138	def test_findings_ledger_and_audit(tmp_path):
+139	    import muck.extract.entities as ent
+140	    from muck import findings as fl
+```
+
+**Tool Call: Read tests/test_pipeline_e2e.py (545 - 574)**
+Status: Completed
+
+```
+545	    res = rec.recall(conn, settings, "prescription drug pricing", mode="keyword")
+546	    assert res and "weather" not in res[0]["text"]  # relevant first
+547	    assert {r["type"] for r in res} == {"observation", "finding"}  # both layers searched
+548	    only_findings = rec.recall(conn, settings, "drug", kind="finding", mode="keyword")
+549	    assert only_findings and all(r["type"] == "finding" for r in only_findings)
+550	
+551	
+552	def test_recall_semantic_optional(tmp_path):
+553	    """Tier 2 semantic: recall finds memory by meaning, not just shared words."""
+554	    from muck import config as cfg
+555	    from muck import observations as obs
+556	    from muck.db import DB_FILENAME, connect, init_schema
+557	    from muck.embedders import build_embedder
+558	    from muck.search import recall as rec
+559	
+560	    conn = connect(tmp_path / DB_FILENAME)
+561	    init_schema(conn)
+562	    obs.add(conn, "Acme lobbied on prescription drug pricing", kind="lead")
+563	    obs.add(conn, "office snacks restock schedule", kind="note")
+564	    settings = cfg.Settings()
+565	    try:
+566	        _ = build_embedder(settings).dim
+567	    except Exception as e:
+568	        pytest.skip(f"embedding model unavailable: {e}")
+569	    res = rec.recall(conn, settings, "lowering medication costs", mode="semantic")
+570	    assert res and "drug pricing" in res[0]["text"].lower()  # matched by meaning, no shared terms
+571	
+572	
+573	def test_reconcile_dedupe_and_link(tmp_path):
+574	    """Splink multi-field reconciliation: merge messy variants, avoid false merges, link datasets."""
+```
+
+## Assistant
+
+Now updating the existing grep test and adding the new tests:
+
+**Tool Call: Edit tests/test\_pipeline\_e2e.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/tests/test_pipeline_e2e.py
+```
+def test_grep_exact_string(tmp_path):
+    _, _, settings, conn, _ = build(tmp_path, embeddings=False)
+    hits, total = q.grep(conn, settings, r"H\.R\. 1234", 10)
+    assert len(hits) >= 2  # appears in filings + the press release
+    assert total == len(hits)  # k=10 is not a binding cap here
+    assert all(h.citation.token for h in hits)
+
+
+def test_grep_total_and_all(tmp_path):
+    _, _, settings, conn, _ = build(tmp_path, embeddings=False)
+    all_hits, total = q.grep(conn, settings, r"\w", 0)  # matches every chunk; k=0 = no cap
+    assert total > 1 and len(all_hits) == total
+    capped, capped_total = q.grep(conn, settings, r"\w", 1)
+    assert len(capped) == 1 and capped_total == total  # exact total survives the cap
+    keys = [(h.doc_id, h.citation.char_start) for h in all_hits]
+    assert keys == sorted(keys)  # deterministic, grouped by document
+
+
+def build_texts(tmp_path: Path, files: dict, embeddings: bool = False):
+    """Corpus of parser-only files (txt) for grep/snippet/notice tests."""
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    for name, content in files.items():
+        p = corpus / name
+        p.write_bytes(content) if isinstance(content, bytes) else p.write_text(content)
+    muck_dir = corpus / cfg.MUCK_DIRNAME
+    (muck_dir / "cache").mkdir(parents=True)
+    cfg.write_default_config(muck_dir)
+    settings = cfg.load_settings(muck_dir)
+    settings.embedder.enabled = embeddings
+    conn = connect(muck_dir / DB_FILENAME)
+    init_schema(conn)
+    pipeline.ingest(conn, [str(corpus / n) for n in files])
+    pipeline.extract(conn, settings, pipeline.PARSER_TYPES)
+    result = pipeline.run_index(conn, settings)
+    return settings, conn, result
+
+
+def test_grep_phrase_across_linebreak(tmp_path):
+    """Literal spaces match PDF-style line breaks, consistent with verify's normalization."""
+    settings, conn, _ = build_texts(tmp_path, {
+        "minutes.txt": (
+            b"The General Meeting resolved the suspension of the Libyan \r\nStock Market "
+            b"from the association effective immediately."
+        ),
+    })
+    hits, total = q.grep(conn, settings, "Libyan Stock Market", 10)
+    assert total == 1 and "Libyan" in hits[0].snippet
+
+
+def test_ws_tolerant_translation():
+    from muck.stores.sqlite_store import _ws_tolerant
+
+    assert _ws_tolerant("Libyan Stock Market") == r"Libyan\s+Stock\s+Market"
+    assert _ws_tolerant("a  b") == r"a\s+b"  # runs collapse to one \s+
+    assert _ws_tolerant(r"[a ]") == r"[a ]"  # classes untouched
+    assert _ws_tolerant(r"a\ b") == r"a\ b"  # escaped space untouched
+    assert _ws_tolerant("a ?b") == r"a\s?b"  # quantifier keeps its meaning
+
+
+_FILLER = "The committee discussed procedural matters and vote counting rules at length. "
+_TARGET = "The Nairobi Stock Exchange was suspended from membership by resolution. "
+
+
+def test_best_window_lexical_fallback():
+    from muck.search.query import _best_window
+
+    text = _FILLER * 8 + _TARGET + _FILLER * 8
+    assert "Nairobi" in _best_window(text, "which members were suspended from membership")
+    # No query / no overlap -> chunk head, the old behavior.
+    assert _best_window(text, "") == _best_window(text, "quantum blockchain synergy")
+    assert _best_window(text, "").startswith(_FILLER.strip()[:40])
+
+
+def test_snippet_query_relevant_for_semantic_hits(tmp_path):
+    """Vector-leg hits (no FTS5 snippet) window around the query-relevant sentence."""
+    from muck.embedders import build_embedder
+
+    try:
+        _ = build_embedder(cfg.Settings()).dim
+    except Exception as e:
+        pytest.skip(f"embedding model unavailable: {e}")
+    settings, conn, _ = build_texts(
+        tmp_path, {"report.txt": _FILLER * 8 + _TARGET + _FILLER * 8}, embeddings=True
+    )
+    hits = q.search(conn, settings, "member removed lost membership", "semantic", 3)
+    assert hits, "semantic search returned nothing"
+    assert any("Nairobi" in h.snippet for h in hits)
+
+
+def test_index_notice_pure_parsed_corpus(tmp_path):
+    settings, conn, result = build_texts(
+        tmp_path, {"doc.txt": "Plain parsed text about the annual meeting. " * 20}
+    )
+    assert "entity_fields" in result.get("notice", "")
+    assert "notice" in pipeline.status(conn, settings)
+
+
+def test_index_no_notice_with_json(tmp_path):
+    _, _, settings, conn, result = build(tmp_path, embeddings=False)
+    assert "notice" not in result
+    assert "notice" not in pipeline.status(conn, settings)
+```
+
+
+## Assistant
+
+Now run the test suite:
+
+**Tool Call: uv run pytest tests/ -x -q 2>&1 | tail -30**
+Status: Completed
+
+Terminal:
+```
+warning: The `tool.uv.dev-dependencies` field (used in `pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+   Building muck @ file:///Users/vibes/Documents/Development/Projects/muck
+      Built muck @ file:///Users/vibes/Documents/Development/Projects/muck
+Uninstalled 1 package in 18ms
+Installed 1 package in 1ms
+........F
+=================================== FAILURES ===================================
+________________________ test_index_no_notice_with_json ________________________
+
+tmp_path = PosixPath('/private/var/folders/_g/t_yssp6n04gdv1kccf92418c0000gn/T/pytest-of-Vibes/pytest-22/test_index_no_notice_with_json0')
+
+    def test_index_no_notice_with_json(tmp_path):
+        _, _, settings, conn, result = build(tmp_path, embeddings=False)
+>       assert "notice" not in result
+E       AssertionError: assert 'notice' not in {'documents': 4, 'chunks': 4, 'embeddings': 'off (keyword-only)', 'entity_index': {'entities': 2, 'mentions': 4, 'edges': 0}, ...}
+
+tests/test_pipeline_e2e.py:177: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_pipeline_e2e.py::test_index_no_notice_with_json - Assertion...
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 8 passed in 1.99s
+```
+
+
+**Tool Call: Edit src/muck/pipeline.py**
+Status: Completed
+
+Diff: /Users/vibes/Documents/Development/Projects/muck/src/muck/pipeline.py
+```
+def _entity_inertia_notice(conn) -> str | None:
+    """Explain near-empty entity counts on parse-only corpora (no JSON entity_fields)."""
+    ph = ",".join("?" * len(PARSER_TYPES))
+    parsed = conn.execute(
+        f"SELECT COUNT(*) FROM documents WHERE doc_type IN ({ph})", sorted(PARSER_TYPES)
+    ).fetchone()[0]
+    ph = ",".join("?" * len(MAPPER_TYPES))
+    mapped = conn.execute(
+        f"SELECT COUNT(*) FROM documents WHERE doc_type IN ({ph})", sorted(MAPPER_TYPES)
+    ).fetchone()[0]
+    if parsed and not mapped:
+```
+
+
+**Tool Call: uv run pytest tests/ -q 2>&1 | tail -12**
+Status: Completed
+
+Terminal:
+```
+Traceback:
+../../../../.local/share/uv/python/cpython-3.12.12-macos-aarch64-none/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_pipeline_e2e.py:15: in <module>
+    import muck.mappers  # noqa: F401
+    ^^^^^^^^^^^^^^^^^^^
+E   ModuleNotFoundError: No module named 'muck.mappers'
+=========================== short test summary info ============================
+ERROR tests/test_pipeline_e2e.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.05s
+```
+
+
+**Tool Call: uv sync --no-editable -q && uv run --no-sync pytest tests/ -q 2>&1 | tail -12**
+Status: Completed
+
+Terminal:
+```
+warning: The `tool.uv.dev-dependencies` field (used in `pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+.............ss.s.s...........s.                                         [100%]
+27 passed, 5 skipped in 2.60s
+
+
+```
+
+
+**Tool Call: uv run --no-sync pytest tests/ -q -rs 2>&1 | tail -12**
+Status: Completed
+
+Terminal:
+```
+warning: The `tool.uv.dev-dependencies` field (used in `pyproject.toml`) is deprecated and will be removed in a future release; use `dependency-groups.dev` instead
+.............ss.s.s...........s.                                         [100%]
+=========================== short test summary info ============================
+SKIPPED [1] tests/test_pipeline_e2e.py:274: duckdb / sqlite extension unavailable
+SKIPPED [1] tests/test_pipeline_e2e.py:298: duckdb unavailable
+SKIPPED [1] tests/test_pipeline_e2e.py:323: embedding model unavailable: clustering needs scikit-learn; install with `uv sync --extra analytics`
+SKIPPED [1] tests/test_pipeline_e2e.py:363: turbovec not installed
+SKIPPED [1] tests/test_pipeline_e2e.py:675: splink not installed
+27 passed, 5 skipped in 1.20s
+```
+
+
+**Tool Call: cp /Users/vibes/Documents/Development/Projects/muck/skill/SKILL.md /Users/vibes/.claude/skills/muck/SKILL.md && cp /Users/vibes/Documents/Development/Projects/muck/skill/references/QUERIES.md /Users/vibes/.claude/skills/muck/references/QUERIES.md && echo synced**
+Status: Completed
+
+Terminal:
+```
+synced
+
+
+
+
+
+```
+
+
+**Tool Call: cd /Users/vibes/Documents/Development/Projects/anna && /Users/vibes/Documents/Development/Projects/muck/.venv/bin/muck search "member removed from ANNA lost membership" -k 5 2>/dev/null | python3 -c "
+import json,sys
+hits = json.load(sys.stdin)
+for h in hits:
+    print(h['doc_title'][:40], '|', h['chunk_id'], '|', h['snippet'][:120].replace(chr(10),' '))
+"**
+Status: Completed
+
+Terminal:
+```
+ shares shall be each Member of ANNA and the number of its
+ Guidadoption of the ANNA Membership pprove 166 and ISO 10962 assignment
+ the servicesip in ANNA does not confer the right to make use of
+  The ANNA members approve the adoption of the ANNA Membership Guidelines, as of 2020. 
+ the ANNA membership remainsbership position,…As a result of the new applications and the
+Shell cwd was reset to /Users/vibes/Documents/Development/Projects/muck
+```
+
+
+**Tool Call: cd /Users/vibes/Documents/Development/Projects/anna && sqlite3 .muck/index.db "SELECT text FROM chunks WHERE chunk_id='f2035af77c6.0#1'" | head -60**
+Status: Completed
+
+Terminal:
+```
+The Board also proposed an amendment to
+the ANNA membership guidelines that
+clarifies the position on the absence of
+members during a General Meeting at time of
+vote.
+•Resolution 5: The ANNA members approve
+an amendment to the ANNA Membership
+Guidelines to include ISO 18774 alongside the
+existing ISO 6166 and ISO 10962 assignment
+responsibilities. The ANNA members approve
+the adoption of the ANNA Membership
+Guidelines May 2017 as presented by the
+ANNA Board.
+Suspension of Partnership/Membership
+•Resolution 4: Due to the inability to resolve
+the outstanding issues raised, the ANNA
+Membership authorises the ANNA Board to
+proceed with the suspension of their
+partnership/membership and to communicate
+this to the Nairobi Stock Exchange & Libyan
+Stock Market and their local market Regulator.
+Financials
+Resolutions related to the Financial Report
+2016 as well as financial documentation were
+sent to the membership prior to the General
+Meeting. The ANNA Treasurer, Dr. Tarek
+Abdel Bary (TA), confirmed that part of the
+funds loaned from ANNA to the DSB, that is
+due to be paid back in 2018, partly relates to
+2016 (EUR 780K) and the remaining part (EUR
+70K) is to be accounted for in 2017 the
+resulting total being EUR 850K.
+The exceeding budget for lawyer related costs
+is part of the loan given to the DSB.
+The following Resolutions 1 to 3 were passed
+unanimously:
+•Resolution 1*: The General Assembly accepts
+the audited financial figures of ANNA for the
+financial year 2016 with a balance sheet total
+of EUR 1,725,476 and a profit of EUR 83,204
+•Resolution 2: The ANNA members accept the
+report issued by the external auditor KPMG,
+Belgium.
+•Resolution 3: The ANNA members discharge
+the Board of Directors of ANNA of their duties.
+*Resolution #1: Financial Report 2016
+Old Resolution: The General Assembly accepts
+the audited financial figures of ANNA for the
+Shell cwd was reset to /Users/vibes/Documents/Development/Projects/muck
+```
+
+
+**Tool Call: cd /Users/vibes/Documents/Development/Projects/anna && /Users/vibes/Documents/Development/Projects/muck/.venv/bin/python3 - <<'EOF'
+import re, sqlite3
+conn = sqlite3.connect(".muck/index.db")
+text = conn.execute("SELECT text FROM chunks WHERE chunk_id='f2035af77c6.0#1'").fetchone()[0]
+
+from muck.search.query import _SENT_BREAK
+import muck.embedders
+from muck.embedders import build_embedder
+from muck.config import Settings
+
+spans, start = [], 0
+for m in _SENT_BREAK.finditer(text):
+    if text[start:m.start()].strip():
+        spans.append((start, m.start()))
+    start = m.end()
+if text[start:].strip():
+    spans.append((start, len(text)))
+
+emb = build_embedder(Settings())
+query = "member removed from ANNA lost membership"
+qvec = emb.embed([query])[0]
+segs = [text[s:e].strip() for s, e in spans]
+sims = (emb.embed(segs) @ qvec).tolist()
+for sim, seg in sorted(zip(sims, segs), reverse=True):
+    flag = " <-- NAIROBI" if "Nairobi" in seg else ""
+    print(f"{sim:.4f} | {seg[:90].replace(chr(10),' ')}{flag}")
+EOF**
+Status: Completed
+
+Terminal:
+```
+Fetching 10 files: 100%|██████████| 10/10 [00:00<00:00, 13833.46it/s]
+ Guidelines May 2017 as prMembership
+ the Board of Directors of ANNA of their dutiesrge
+ clarifies embership guidelines that mendment to
+ the <-- NAIROBIDue to the inability to resolve
+0.3783 | The ANNA Treasurer, Dr.
+ Guidelinesnt to the ANNA Membership ers approve
+ 2016 as well as financial documecial Report
+ funds loaned from ANNA to the DSB, t of the
+ •Resolution 1*: The General Aions 1 to 3 were passed
+ the Resolution: The General Assembly accepts
+ is part of the loan given to the DSB.er related costs
+Shell cwd was reset to /Users/vibes/Documents/Development/Projects/muck
+```
+
+
+## Assistant
+
+You're out of usage credits. Run /usage-credits to keep using Fable 5 or /model to switch models.
+
+## User
+
+i switched models
+
+## User
+
+hello?
+
+## User
+
+i switched models
+
+## User
+
+??

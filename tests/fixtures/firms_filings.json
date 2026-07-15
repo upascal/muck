@@ -1,0 +1,9 @@
+[
+  {"filing_id": "1", "registrant": "Acme Strategies LLC", "address": "100 K St NW", "zip": "20001", "amount": 180000},
+  {"filing_id": "2", "registrant": "Acme Strategies, L.L.C.", "address": "100 K Street NW", "zip": "20001", "amount": 220000},
+  {"filing_id": "3", "registrant": "Acme Strategis LLC", "address": "100 K St", "zip": "20001", "amount": 90000},
+  {"filing_id": "4", "registrant": "Global Pharma Inc", "address": "50 Main Ave", "zip": "10010", "amount": 300000},
+  {"filing_id": "5", "registrant": "Global Pharma, Incorporated", "address": "50 Main Avenue", "zip": "10010", "amount": 150000},
+  {"filing_id": "6", "registrant": "Capitol Advisors Group", "address": "9 First St", "zip": "20002", "amount": 95000},
+  {"filing_id": "7", "registrant": "Beacon Public Affairs", "address": "100 K St NW", "zip": "20001", "amount": 60000}
+]

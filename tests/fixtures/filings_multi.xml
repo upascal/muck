@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<filings>
+  <filing>
+    <filingId>F-2026-Q1-0001</filingId>
+    <organizationName>Acme Strategies LLC</organizationName>
+    <clientName>Global Pharma Inc.</clientName>
+    <income>180000</income>
+    <specific_issues>
+      <description>Lobbied on H.R. 1234 regarding prescription drug pricing.</description>
+    </specific_issues>
+  </filing>
+  <filing>
+    <filingId>F-2026-Q1-0002</filingId>
+    <organizationName>Capitol Advisors Group</organizationName>
+    <clientName>United Defense Systems</clientName>
+    <income>95000</income>
+    <specific_issues>
+      <description>Appropriations for defense procurement and the NDAA.</description>
+    </specific_issues>
+  </filing>
+  <filing>
+    <filingId>F-2026-Q1-0003</filingId>
+    <organizationName>Beacon Public Affairs</organizationName>
+    <clientName>Northern Energy Coalition</clientName>
+    <income>60000</income>
+    <specific_issues>
+      <description>Clean energy tax credits and grid modernization funding.</description>
+    </specific_issues>
+  </filing>
+</filings>

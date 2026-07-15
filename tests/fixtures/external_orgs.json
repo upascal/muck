@@ -1,0 +1,4 @@
+[
+  {"registrant": "Acme Strategies", "address": "100 K Street Northwest", "zip": "20001", "contract_value": 500000},
+  {"registrant": "Helios Industries", "address": "5 Pine Rd", "zip": "40404", "contract_value": 75000}
+]

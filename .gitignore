@@ -1,0 +1,31 @@
+# Python / virtualenv / caches
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# muck derived index artifacts (rebuildable via `muck build`) — config.toml stays tracked
+**/.muck/index.db
+**/.muck/index.db-shm
+**/.muck/index.db-wal
+**/.muck/pages/
+**/.muck/cache/
+**/.muck/transcripts/
+# runtime audit log — changes on every command
+**/.muck/trace.jsonl
+
+# Raw corpus data — evaluators receive the corpus separately; too large for the repo.
+# Rebuild by placing the corpus under data/corpus_q1/data/ and running `muck build`.
+data/corpus_q1/data/
+data/*.zip
+data/drive-download-*
+
+# OS
+.DS_Store
+
+# corpus + built index are NOT part of the library (evaluators supply the corpus).
+# The field map lives in configs/corpus_q1.toml; copy it into <corpus>/.muck/config.toml.
+data/

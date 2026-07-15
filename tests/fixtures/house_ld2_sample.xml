@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<LOBBYINGDISCLOSURE2>
+  <organizationName>Acme Strategies LLC</organizationName>
+  <clientName>Global Pharma Inc.</clientName>
+  <senateID>401105566-12</senateID>
+  <houseID>301642857</houseID>
+  <reportYear>2026</reportYear>
+  <reportType>Q1</reportType>
+  <income>180000</income>
+  <expenses>
+  </expenses>
+  <alis>
+    <ali_Code>HCR</ali_Code>
+    <ali_Code>TAX</ali_Code>
+    <ali_Code>
+    </ali_Code>
+  </alis>
+  <specific_issues>
+    <description>Lobbied on H.R. 1234 regarding prescription drug pricing and Medicare negotiation provisions.</description>
+  </specific_issues>
+  <lobbyists>
+    <lobbyist>
+      <lobbyistFirstName>Jane</lobbyistFirstName>
+      <lobbyistLastName>Doe</lobbyistLastName>
+      <coveredPosition>Chief of Staff to Sen. Example</coveredPosition>
+      <lobbyistNew>N</lobbyistNew>
+    </lobbyist>
+    <lobbyist>
+      <lobbyistFirstName>Robert</lobbyistFirstName>
+      <lobbyistLastName>Smith</lobbyistLastName>
+      <coveredPosition>
+      </coveredPosition>
+      <lobbyistNew>Y</lobbyistNew>
+    </lobbyist>
+  </lobbyists>
+</LOBBYINGDISCLOSURE2>

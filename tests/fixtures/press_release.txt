@@ -1,0 +1,12 @@
+# Senator Example Announces Drug Pricing Legislation
+
+WASHINGTON — Today Senator Example introduced H.R. 1234, a bill aimed at lowering
+prescription drug prices through expanded Medicare negotiation authority. The measure
+has drawn intense interest from the pharmaceutical lobby.
+
+"Families should not have to choose between medicine and rent," the Senator said in a
+statement. Industry groups, including clients represented by Acme Strategies LLC, have
+spent heavily opposing similar provisions in prior quarters.
+
+The bill now heads to committee, where Global Pharma Inc. and other stakeholders are
+expected to weigh in during markup.

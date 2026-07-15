@@ -1,0 +1,48 @@
+[mapper]
+json = "json"
+
+# Global fallback (unused once both sources match).
+[mapper.fields]
+
+# Per-source maps — first matching glob wins.
+[[mapper.sources]]
+match = "*/congress_press/*"
+record_id = "url"
+title_template = "{title}"
+text_fields = ["title", "text"]
+structured_fields = ["title", "date", "domain", "url", "member.bioguide_id", "member.name", "member.party", "member.state", "member.chamber"]
+entity_fields = ["member.name:person"]
+
+[[mapper.sources]]
+match = "*/senate/*/filings*"
+record_id = "filing_uuid"
+title_template = "{filing_type_display} — {filing_period_display}"
+structured_fields = [
+    "filing_uuid", "filing_type", "filing_period", "filing_year", "income", "expenses",
+    "registrant.name", "client.name",
+    # array-path (multi-valued) fields — power the aggregation/anomaly playbooks
+    "lobbying_activities[].general_issue_code_display as issue_code",
+    "lobbying_activities[].government_entities[].name as government_entity",
+    "lobbying_activities[].lobbyists[].covered_position as covered_position",
+    "lobbying_activities[].description as activity_desc",
+]
+entity_fields = ["registrant.name:org", "client.name:org"]
+
+[[mapper.sources]]
+match = "*/senate/*/contributions*"
+record_id = "filing_uuid"
+structured_fields = [
+    "filing_uuid", "filing_year", "registrant.name",
+    # follow-the-money: who lobbyist PACs pay (categorical — safe to de-dup per record)
+    "contribution_items[].honoree_name as honoree",
+    "contribution_items[].payee_name as payee",
+]
+entity_fields = ["registrant.name:org"]
+
+[embedder]
+enabled = true
+name = "potion"
+revision = "bf8b056651a2c21b8d2565580b8569da283cab23"  # pinned potion-base-8M weights (reproducible)
+
+[entities]
+resolve = true

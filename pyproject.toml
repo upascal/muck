@@ -1,0 +1,43 @@
+[project]
+name = "muck"
+version = "1.0.0"
+description = "Modular many-document investigation pipeline for AI agents — JSON/PDF corpora, citation-verified retrieval, packaged as a Claude skill."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "pydantic>=2.6",
+    "numpy>=1.26",
+    "pypdfium2>=4.30",
+    "sqlite-vec>=0.1.6",
+    # Potion embeddings are default-on (CPU, no API, no torch for inference).
+    "model2vec>=0.3",
+]
+
+[project.optional-dependencies]
+# Structured analytics + clustering (Phase 2).
+analytics = ["duckdb>=1.0", "scikit-learn>=1.4"]
+# Upgrade adapters (Phase 3).
+docx = ["python-docx>=1.1"]
+sbert = ["sentence-transformers>=3.0"]
+docling = ["docling>=2.0"]
+pymupdf = ["pymupdf>=1.24"]
+api = ["httpx>=0.27"]
+splink = ["splink>=4.0"]
+turbovec = ["turbovec>=0.8"]  # in-memory ANN accelerator for large corpora (needs arm64/linux wheel)
+all = [
+    "muck[analytics,docx,sbert,docling,pymupdf,api,splink,turbovec]",
+]
+
+[project.scripts]
+muck = "muck.cli:main"
+
+[tool.uv]
+dev-dependencies = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/muck"]

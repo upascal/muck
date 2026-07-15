@@ -1,0 +1,35 @@
+{
+  "source": "Senate LDA — sample",
+  "results": [
+    {
+      "filing_uuid": "F-2024-Q3-0001",
+      "registrant": "Acme Strategies LLC",
+      "client": "Global Pharma Inc.",
+      "filing_period": "2024 Q3",
+      "amount": 180000,
+      "issues": "Lobbied on H.R. 1234 regarding prescription drug pricing and Medicare negotiation provisions.",
+      "lobbyists": ["Jane Doe", "Robert Smith"],
+      "filed_date": "2024-10-20"
+    },
+    {
+      "filing_uuid": "F-2024-Q3-0002",
+      "registrant": "Capitol Advisors Group",
+      "client": "United Defense Systems",
+      "filing_period": "2024 Q3",
+      "amount": 95000,
+      "issues": "Appropriations for defense procurement; discussions on H.R. 5678 and the NDAA.",
+      "lobbyists": ["Jane Doe"],
+      "filed_date": "2024-10-19"
+    },
+    {
+      "filing_uuid": "F-2024-Q4-0007",
+      "registrant": "Acme Strategies, L.L.C.",
+      "client": "Global Pharma, Inc.",
+      "filing_period": "2024 Q4",
+      "amount": 220000,
+      "issues": "Continued advocacy on prescription drug pricing; opposition to Medicare negotiation expansion under H.R. 1234.",
+      "lobbyists": ["Robert Smith", "Maria Garcia"],
+      "filed_date": "2025-01-18"
+    }
+  ]
+}
